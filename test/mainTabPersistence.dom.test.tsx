@@ -26,9 +26,10 @@ vi.mock("../src/components/ancillaries/AncillariesTab", () => ({
   default: () => <input aria-label="Ancillaries state" defaultValue="" />,
 }));
 vi.mock("../src/components/PresetsTab", () => ({ default: () => <div /> }));
+vi.mock("../src/components/loadOrderRules/LoadOrderRulesTab", () => ({ default: () => <div /> }));
 vi.mock("../src/components/Categories", () => ({ default: () => <div>Categories tab</div> }));
-vi.mock("../src/components/ModRows", () => ({ default: () => <div /> }));
-vi.mock("../src/components/Sidebar", () => ({ default: () => <div /> }));
+vi.mock("../src/components/ModRows", () => ({ default: () => <div id="rowsParent" /> }));
+vi.mock("../src/components/Sidebar", () => ({ default: () => <input id="filterInput" aria-label="Mod filter" /> }));
 vi.mock("../src/components/ModTagPicker", () => ({ default: () => <div /> }));
 
 describe("main tab persistence", () => {
@@ -98,6 +99,36 @@ describe("main tab persistence", () => {
     expectTabKeepsItsState(renderMain(), "ancillaries", "Ancillaries state");
   });
 
+  it("starts the asset host only while Visuals or Unit Viewer is the visible tab", () => {
+    const originalApi = window.api;
+    const startWh3AssetHost = vi.fn().mockResolvedValue({ success: true });
+    const stopWh3AssetHost = vi.fn().mockResolvedValue({ success: true });
+    window.api = { ...window.api, startWh3AssetHost, stopWh3AssetHost } as NonNullable<Window["api"]>;
+
+    try {
+      const store = renderMain();
+
+      act(() => store.dispatch(setCurrentTab("visuals")));
+      expect(startWh3AssetHost).toHaveBeenCalledOnce();
+
+      // Both tabs share the same lifecycle, so moving directly between them keeps the process alive.
+      act(() => store.dispatch(setCurrentTab("unitViewer")));
+      expect(startWh3AssetHost).toHaveBeenCalledOnce();
+      expect(stopWh3AssetHost).not.toHaveBeenCalled();
+
+      act(() => store.dispatch(setCurrentTab("categories")));
+      expect(stopWh3AssetHost).toHaveBeenCalledOnce();
+
+      act(() => store.dispatch(setCurrentTab("visuals")));
+      expect(startWh3AssetHost).toHaveBeenCalledTimes(2);
+
+      act(() => store.dispatch(setCurrentTab("mods")));
+      expect(stopWh3AssetHost).toHaveBeenCalledTimes(2);
+    } finally {
+      window.api = originalApi;
+    }
+  });
+
   it("does not mount Ancillaries for a game that has none", () => {
     const store = renderMain({ currentGame: "wh2" as const });
 
@@ -124,5 +155,26 @@ describe("main tab persistence", () => {
     // The tab is not available for wh2, so the request lands on mods and nothing is mounted.
     expect(store.getState().app.currentTab).toBe("mods");
     expect(screen.queryByLabelText("Tech trees state")).not.toBeInTheDocument();
+  });
+
+  it("moves Ctrl+F to the sidebar filter while mod rows exist", () => {
+    renderMain({ currentTab: "mods" as const });
+    const filterInput = screen.getByLabelText("Mod filter");
+    const event = new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true, cancelable: true });
+
+    document.dispatchEvent(event);
+
+    expect(filterInput).toHaveFocus();
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("leaves Ctrl+F alone when mod rows do not exist", () => {
+    renderMain({ currentTab: "categories" as const });
+    const event = new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true, cancelable: true });
+
+    document.dispatchEvent(event);
+
+    expect(screen.queryByLabelText("Mod filter")).not.toBeInTheDocument();
+    expect(event.defaultPrevented).toBe(false);
   });
 });

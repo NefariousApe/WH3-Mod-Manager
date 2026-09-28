@@ -14,6 +14,7 @@ import {
   setIsFeaturesForModdersEnabled,
   setModdersPrefix,
   setPacksData,
+  setRecentPackPaths,
   setReferencesHash,
   setStartArgs,
   setDeletedPackFilePaths,
@@ -26,7 +27,6 @@ import { tableNameWithDBPrefix } from "./utility/packFileHelpers";
 
 setupRendererLogging();
 
-console.log("IN RENDERER (viewer)");
 
 const stripUnsavedFileBuffers = (unsavedFileData: PackedFile[]): PackedFile[] =>
   unsavedFileData.map(({ buffer, ...unsavedFile }) => unsavedFile);
@@ -49,6 +49,10 @@ window.api?.setModdersPrefix((event, moddersPrefix) => {
 
 window.api?.setCurrentGameNaive((event, game) => {
   store.dispatch(setCurrentGameNaive(game));
+});
+
+window.api?.setRecentPackPaths((event, packPaths) => {
+  store.dispatch(setRecentPackPaths(packPaths));
 });
 
 window.api?.openModInViewer((event, modPath: string) => {

@@ -7,9 +7,16 @@ import { SortingType } from "./utility/modRowSorting";
 import {
   compareModNames,
   getSparseLoadOrderByModName,
+  setActiveLoadOrderEdges,
   sortModsAsInEntries,
   sortByNameAndLoadOrder,
 } from "./modSortingHelpers";
+import {
+  loadOrderPackNameKey,
+  loadOrderRuleKey,
+  normalizeLoadOrderPackName,
+  resolveLoadOrderRules,
+} from "./loadOrderRules";
 import {
   isPresetModEnabled,
   toPresetEntries,
@@ -19,7 +26,7 @@ import {
 import initialState from "./initialAppState";
 import equal from "fast-deep-equal";
 import { format } from "date-fns";
-import { SupportedGames } from "./supportedGames";
+import { SupportedGames, vanillaPackNames } from "./supportedGames";
 import { packDataStore } from "./components/viewer/packDataStore";
 import { getUsedModImport } from "./usedMods";
 import { isSupportedLanguage } from "./utility/sharedHelpers";
@@ -28,8 +35,31 @@ import { sharedModMatchesInstalledMod } from "./sharedModList";
 import { isHideableMainWindowTab } from "./utility/frontend/mainWindowTabs";
 import { DEFAULT_DB_TABLE_ROOT } from "./utility/packFileHelpers";
 import { uncategorizedCategoryName } from "./utility/categoryNames";
+import { sanitizeRecentPackPaths } from "./utility/recentPackPaths";
 
 const packFilePathKey = (path: string) => path.replaceAll("/", "\\").toLowerCase();
+
+/**
+ * Re-resolves the rules and republishes them.
+ *
+ * The result goes into state so React memos can depend on it, and into the module level registry so
+ * the many callers that sort without a redux connection - the used_mods.txt writer, preset helpers -
+ * see the same ordering. Both have to be updated together or the two would disagree.
+ */
+const refreshLoadOrderRules = (state: AppState) => {
+  const { edges, ...resolution } = resolveLoadOrderRules({
+    userRules: state.loadOrderRules,
+    modRules: state.modLoadOrderRules,
+    disabledRuleKeys: state.disabledModLoadOrderRules,
+    disabledPackNames: state.loadOrderRuleDisabledPacks,
+    // Every known pack, not just the enabled ones: a rule about a pack that is merely switched off
+    // is still a real rule, and applying edges to a list simply ignores packs the list lacks.
+    presentPackNames: state.currentPreset.mods.map((mod) => mod.name),
+  });
+
+  state.loadOrderRulesResolution = resolution;
+  setActiveLoadOrderEdges(edges);
+};
 
 const isMainWindowTabAvailable = (state: AppState, tab: MainWindowTab) => {
   if (isHideableMainWindowTab(tab) && state.hiddenMainWindowTabs.includes(tab)) return false;
@@ -56,6 +86,8 @@ const isMainWindowTabAvailable = (state: AppState, tab: MainWindowTab) => {
       return state.currentGame === "wh3";
     case "nodeEditor":
       return state.isFeaturesForModdersEnabled;
+    case "loadOrderRules":
+      return true;
     case "twui":
       return false;
     default:
@@ -188,6 +220,8 @@ const applyPresetEntriesToMods = (mods: Mod[], entries: PresetModEntry[]) => {
 };
 
 const setCurrentPresetToMods = (state: AppState, mods: Mod[]) => {
+  // Which packs exist decides which rules are live and which are reported as naming a missing pack,
+  // so the resolution is refreshed at the end of this function.
   const previousModsByName = new Map(state.currentPreset.mods.map((mod) => [mod.name, mod]));
   const workshopSubscriptionTimesByName = new Map<string, number>();
   for (const mod of mods) {
@@ -237,6 +271,9 @@ const setCurrentPresetToMods = (state: AppState, mods: Mod[]) => {
     }
   }
 
+  // Before sanitize, which sorts: the rules have to be current or it would pin today's positions
+  // against yesterday's ordering.
+  refreshLoadOrderRules(state);
   sanitizeEnabledModLoadOrders(state.currentPreset.mods);
 
   const appStartIndex = state.presets.findIndex((preset) => preset.name === "On App Start");
@@ -934,6 +971,11 @@ const appSlice = createSlice({
         // Propagate Workshop metadata to whichever same-named source currently wins priority.
         const contentMod = state.allMods.find((mod) => isWorkshopMod(mod) && mod.workshopId == data.workshopId);
         if (contentMod) {
+          // Keep the Workshop source hydrated as well. A same-named Data copy can be the visible
+          // winner, but the Workshop entry is used as the fallback while that Data copy is re-read.
+          if (data.humanName && data.humanName != "" && contentMod.humanName != data.humanName)
+            contentMod.humanName = data.humanName;
+          if (data.author && data.author != "" && contentMod.author != data.author) contentMod.author = data.author;
           const preferredMod = state.currentPreset.mods.find((iterMod) => iterMod.name == contentMod.name);
           if (preferredMod) {
             if (data.humanName && data.humanName != "" && preferredMod.humanName != data.humanName)
@@ -1101,6 +1143,9 @@ const appSlice = createSlice({
       if (deletedFilePaths.length === 0) delete state.deletedPackFilePaths[packPath];
       else state.deletedPackFilePaths[packPath] = deletedFilePaths;
     },
+    setRecentPackPaths: (state: AppState, action: PayloadAction<string[]>) => {
+      state.recentPackPaths = sanitizeRecentPackPaths(action.payload, vanillaPackNames);
+    },
     setPacksDataRead: (state: AppState, action: PayloadAction<string[]>) => {
       const packPaths = action.payload;
 
@@ -1152,6 +1197,12 @@ const appSlice = createSlice({
 
       state.areThumbnailsEnabled = fromConfigAppState.areThumbnailsEnabled;
       state.isClosedOnPlay = fromConfigAppState.isClosedOnPlay;
+      state.workshopModStagingMode = ["disabled", "copy", "symlink"].includes(fromConfigAppState.workshopModStagingMode)
+        ? fromConfigAppState.workshopModStagingMode
+        : "disabled";
+      state.compressWorkshopModsOnStart =
+        state.workshopModStagingMode === "copy" && !!fromConfigAppState.compressWorkshopModsOnStart;
+      state.cleanUpWorkshopModStagingAfterGameExit = !!fromConfigAppState.cleanUpWorkshopModStagingAfterGameExit;
       state.isUsingEnglishLocalizations = !!fromConfigAppState.isUsingEnglishLocalizations;
       state.isCompatCheckingVanillaPacks =
         !!fromConfigAppState.isFeaturesForModdersEnabled && !!fromConfigAppState.isCompatCheckingVanillaPacks;
@@ -1174,6 +1225,9 @@ const appSlice = createSlice({
       state.isChangingGameProcessPriority = fromConfigAppState.isChangingGameProcessPriority;
       state.isFeaturesForModdersEnabled = fromConfigAppState.isFeaturesForModdersEnabled;
       state.moddersPrefix = fromConfigAppState.moddersPrefix || "";
+      state.isRigidModelV2CompressionEnabled =
+        fromConfigAppState.isRigidModelV2CompressionEnabled ?? state.isRigidModelV2CompressionEnabled;
+      state.compressModsOnUpload = fromConfigAppState.compressModsOnUpload ?? state.compressModsOnUpload;
       state.nodeEditorFavorites = fromConfigAppState.nodeEditorFavorites || [];
       state.modRowsSortingType = fromConfigAppState.modRowsSortingType || state.modRowsSortingType;
       state.enabledModsPaneSortingType =
@@ -1198,6 +1252,14 @@ const appSlice = createSlice({
         fromConfigAppState.isVisualsSortByCultureEnabled ?? state.isVisualsSortByCultureEnabled;
       state.isVisualsHideDuplicatesEnabled =
         fromConfigAppState.isVisualsHideDuplicatesEnabled ?? state.isVisualsHideDuplicatesEnabled;
+      state.unitViewerMode =
+        fromConfigAppState.unitViewerMode === "visualize" || fromConfigAppState.unitViewerMode === "compare"
+          ? fromConfigAppState.unitViewerMode
+          : "visualize";
+      state.unitViewerShowWireframe = fromConfigAppState.unitViewerShowWireframe ?? true;
+      state.unitViewerUnsyncedAnimations = fromConfigAppState.unitViewerUnsyncedAnimations ?? true;
+      state.unitViewerShowUnitCard = fromConfigAppState.unitViewerShowUnitCard ?? true;
+      state.recentPackPaths = sanitizeRecentPackPaths(fromConfigAppState.recentPackPaths, vanillaPackNames);
 
       const categoriesFromMods = new Set(state.currentPreset.mods.map((mod) => mod.categories ?? []).flat());
       if (fromConfigAppState.categories) {
@@ -1206,9 +1268,20 @@ const appSlice = createSlice({
       state.categories = Array.from(categoriesFromMods);
       state.categoryColors = fromConfigAppState.categoryColors || {};
 
+      // Rules are stored per game, so a game switch arrives here as a wholesale replacement. Missing
+      // this would leave the previous game's rules quietly reordering the new game's list.
+      //
+      // A rule with no subject predates the field and cannot be repaired - which of the two mods it
+      // was about is simply not recorded - so it is dropped rather than silently behaving unlike
+      // every other rule. The feature was never released, so this only affects local test data.
+      state.loadOrderRules = (fromConfigAppState.loadOrderRules ?? []).filter((rule) => rule && rule.subjectPackName);
+      state.disabledModLoadOrderRules = fromConfigAppState.disabledModLoadOrderRules ?? [];
+      state.loadOrderRuleDisabledPacks = fromConfigAppState.loadOrderRuleDisabledPacks ?? [];
+
       findAlwaysEnabledMods(state.currentPreset.mods, fromConfigAppState.alwaysEnabledModNames).forEach(
         (mod) => (mod.isEnabled = true),
       );
+      refreshLoadOrderRules(state);
       sanitizeEnabledModLoadOrders(state.currentPreset.mods);
 
       state.wasOnboardingEverRun = fromConfigAppState.wasOnboardingEverRun;
@@ -1321,6 +1394,71 @@ const appSlice = createSlice({
         const loadOrder = loadOrderByModName.get(mod.name);
         if (loadOrder != null) mod.loadOrder = loadOrder;
       });
+    },
+    /**
+     * Adds one of the user's own rules. The pair is unique, so re-stating a pair the other way round
+     * replaces it rather than creating a contradiction the resolver would have to break.
+     */
+    addLoadOrderRule: (state: AppState, action: PayloadAction<LoadOrderRule>) => {
+      const before = normalizeLoadOrderPackName(action.payload.before);
+      const after = normalizeLoadOrderPackName(action.payload.after);
+      if (before === "" || after === "" || loadOrderPackNameKey(before) === loadOrderPackNameKey(after)) return;
+
+      // The subject decides which of the two mods moves, so it has to be one of them.
+      const subjectPackName = normalizeLoadOrderPackName(action.payload.subjectPackName);
+      const subjectKey = loadOrderPackNameKey(subjectPackName);
+      if (subjectKey !== loadOrderPackNameKey(before) && subjectKey !== loadOrderPackNameKey(after)) return;
+
+      const pairKey = [loadOrderPackNameKey(before), loadOrderPackNameKey(after)].sort().join("\t");
+      state.loadOrderRules = state.loadOrderRules.filter(
+        (rule) => [loadOrderPackNameKey(rule.before), loadOrderPackNameKey(rule.after)].sort().join("\t") !== pairKey,
+      );
+      // Re-stating a pair replaces it, so the most recent edit also decides which mod moves.
+      state.loadOrderRules.push({ before, after, subjectPackName });
+      refreshLoadOrderRules(state);
+    },
+    removeLoadOrderRule: (state: AppState, action: PayloadAction<Pick<LoadOrderRule, "before" | "after">>) => {
+      const targetKey = loadOrderRuleKey({ before: action.payload.before, after: action.payload.after });
+      state.loadOrderRules = state.loadOrderRules.filter(
+        (rule) => loadOrderRuleKey({ before: rule.before, after: rule.after }) !== targetKey,
+      );
+      refreshLoadOrderRules(state);
+    },
+    /**
+     * Switches one mod-supplied rule off. Stored as an opt-out key rather than a flag on the rule,
+     * because the rule lives in someone else's pack and is re-read from scratch on every scan.
+     */
+    setModLoadOrderRuleDisabled: (
+      state: AppState,
+      action: PayloadAction<{ rule: Pick<LoadOrderRule, "before" | "after" | "sourcePackName">; isDisabled: boolean }>,
+    ) => {
+      const { rule, isDisabled } = action.payload;
+      if (!rule.sourcePackName) return;
+
+      const key = loadOrderRuleKey(rule);
+      const withoutKey = state.disabledModLoadOrderRules.filter((disabledKey) => disabledKey !== key);
+      state.disabledModLoadOrderRules = isDisabled ? [...withoutKey, key] : withoutKey;
+      refreshLoadOrderRules(state);
+    },
+    /** Ignores a pack's rules wholesale, which unlike ticking them off one by one also covers new ones. */
+    setLoadOrderRulePackDisabled: (
+      state: AppState,
+      action: PayloadAction<{ packName: string; isDisabled: boolean }>,
+    ) => {
+      const packName = normalizeLoadOrderPackName(action.payload.packName);
+      if (packName === "") return;
+
+      const key = loadOrderPackNameKey(packName);
+      const withoutPack = state.loadOrderRuleDisabledPacks.filter(
+        (disabledPack) => loadOrderPackNameKey(disabledPack) !== key,
+      );
+      state.loadOrderRuleDisabledPacks = action.payload.isDisabled ? [...withoutPack, packName] : withoutPack;
+      refreshLoadOrderRules(state);
+    },
+    /** Replaces every mod-supplied rule; the scan that produced them saw the whole mod list. */
+    setModLoadOrderRules: (state: AppState, action: PayloadAction<Record<string, LoadOrderRule[]>>) => {
+      state.modLoadOrderRules = action.payload;
+      refreshLoadOrderRules(state);
     },
     resetModLoadOrderAll: (state: AppState) => {
       state.currentPreset.mods.forEach((mod) => {
@@ -1451,6 +1589,28 @@ const appSlice = createSlice({
     toggleIsClosedOnPlay: (state: AppState) => {
       state.isClosedOnPlay = !state.isClosedOnPlay;
     },
+    setWorkshopModStagingMode: (state: AppState, action: PayloadAction<WorkshopModStagingMode>) => {
+      if (!(["disabled", "copy", "symlink"] as WorkshopModStagingMode[]).includes(action.payload)) {
+        state.workshopModStagingMode = "disabled";
+        state.compressWorkshopModsOnStart = false;
+        state.cleanUpWorkshopModStagingAfterGameExit = false;
+        return;
+      }
+      state.workshopModStagingMode = action.payload;
+      if (action.payload !== "copy") state.compressWorkshopModsOnStart = false;
+      if (action.payload === "disabled") state.cleanUpWorkshopModStagingAfterGameExit = false;
+    },
+    toggleCompressWorkshopModsOnStart: (state: AppState) => {
+      if (state.currentGame !== "wh3" || state.workshopModStagingMode !== "copy") return;
+      state.compressWorkshopModsOnStart = !state.compressWorkshopModsOnStart;
+    },
+    toggleCleanUpWorkshopModStagingAfterGameExit: (state: AppState) => {
+      if (state.workshopModStagingMode === "disabled") {
+        state.cleanUpWorkshopModStagingAfterGameExit = false;
+        return;
+      }
+      state.cleanUpWorkshopModStagingAfterGameExit = !state.cleanUpWorkshopModStagingAfterGameExit;
+    },
     toggleIsUsingEnglishLocalizations: (state: AppState) => {
       state.isUsingEnglishLocalizations = !state.isUsingEnglishLocalizations;
     },
@@ -1481,6 +1641,18 @@ const appSlice = createSlice({
     },
     toggleIsVisualsHideDuplicatesEnabled: (state: AppState) => {
       state.isVisualsHideDuplicatesEnabled = !state.isVisualsHideDuplicatesEnabled;
+    },
+    setUnitViewerMode: (state: AppState, action: PayloadAction<UnitViewerMode>) => {
+      state.unitViewerMode = action.payload;
+    },
+    setUnitViewerShowWireframe: (state: AppState, action: PayloadAction<boolean>) => {
+      state.unitViewerShowWireframe = action.payload;
+    },
+    setUnitViewerUnsyncedAnimations: (state: AppState, action: PayloadAction<boolean>) => {
+      state.unitViewerUnsyncedAnimations = action.payload;
+    },
+    setUnitViewerShowUnitCard: (state: AppState, action: PayloadAction<boolean>) => {
+      state.unitViewerShowUnitCard = action.payload;
     },
     toggleIsPresetAuthorEnabled: (state: AppState) => {
       state.isPresetAuthorEnabled = !state.isPresetAuthorEnabled;
@@ -1526,11 +1698,20 @@ const appSlice = createSlice({
     setModdersPrefix: (state: AppState, action: PayloadAction<string>) => {
       state.moddersPrefix = action.payload;
     },
+    setIsRigidModelV2CompressionEnabled: (state: AppState, action: PayloadAction<boolean>) => {
+      state.isRigidModelV2CompressionEnabled = action.payload;
+    },
+    toggleCompressModsOnUpload: (state: AppState) => {
+      state.compressModsOnUpload = !state.compressModsOnUpload;
+    },
     setIsDev: (state: AppState, action: PayloadAction<boolean>) => {
       state.isDev = action.payload;
     },
     setIsAdmin: (state: AppState, action: PayloadAction<boolean>) => {
       state.isAdmin = action.payload;
+    },
+    setCanCreateSymbolicLinks: (state: AppState, action: PayloadAction<boolean>) => {
+      state.canCreateSymbolicLinks = action.payload;
     },
     setIsWH3Running: (state: AppState, action: PayloadAction<boolean>) => {
       if (state.isWH3Running == action.payload) return;
@@ -1868,6 +2049,11 @@ export const {
   setCurrentGame,
   setCurrentGameNaive,
   resetModLoadOrder,
+  addLoadOrderRule,
+  removeLoadOrderRule,
+  setModLoadOrderRuleDisabled,
+  setLoadOrderRulePackDisabled,
+  setModLoadOrderRules,
   resetModLoadOrderAll,
   toggleAlwaysEnabledMods,
   toggleAlwaysHiddenMods,
@@ -1881,15 +2067,23 @@ export const {
   toggleIsModListCategoryViewEnabled,
   toggleIsVisualsSortByCultureEnabled,
   toggleIsVisualsHideDuplicatesEnabled,
+  setUnitViewerMode,
+  setUnitViewerShowWireframe,
+  setUnitViewerUnsyncedAnimations,
+  setUnitViewerShowUnitCard,
   setModListDensity,
   toggleIsPresetAuthorEnabled,
   toggleArePresetThumbnailsEnabled,
   toggleIsCategoryAuthorEnabled,
   toggleAreCategoryThumbnailsEnabled,
   toggleIsClosedOnPlay,
+  setWorkshopModStagingMode,
+  toggleCompressWorkshopModsOnStart,
+  toggleCleanUpWorkshopModStagingAfterGameExit,
   toggleIsUsingEnglishLocalizations,
   setIsDev,
   setIsAdmin,
+  setCanCreateSymbolicLinks,
   setIsWH3Running,
   setStartArgs,
   setPackHeaderData,
@@ -1901,6 +2095,8 @@ export const {
   toggleIsFeaturesForModdersEnabled,
   setIsFeaturesForModdersEnabled,
   setModdersPrefix,
+  setIsRigidModelV2CompressionEnabled,
+  toggleCompressModsOnUpload,
   setNodeEditorFavorites,
   orderImportedMods,
   addMod,
@@ -1915,6 +2111,7 @@ export const {
   removePackData,
   setUnsavedPacksData,
   setDeletedPackFilePaths,
+  setRecentPackPaths,
   setPacksDataRead,
   setPackCollisions,
   setPackCollisionsCheckProgress,

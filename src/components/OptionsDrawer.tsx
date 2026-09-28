@@ -4,6 +4,9 @@ import {
   toggleAlwaysHiddenMods,
   toggleAreThumbnailsEnabled,
   toggleIsClosedOnPlay,
+  setWorkshopModStagingMode,
+  toggleCompressWorkshopModsOnStart,
+  toggleCleanUpWorkshopModStagingAfterGameExit,
   toggleIsUsingEnglishLocalizations,
   toggleIsAuthorEnabled,
   toggleIsDualModListLayoutEnabled,
@@ -15,9 +18,11 @@ import {
   toggleMakeUnitsGenerals,
   toggleIsChangingGameProcessPriority,
   toggleIsFeaturesForModdersEnabled,
+  setIsRigidModelV2CompressionEnabled,
   setModdersPrefix,
   setIsCreateSteamCollectionOpen,
   setIsImportSteamCollectionOpen,
+  toggleCompressModsOnUpload,
   queueDataModsToEnableByName,
   createBisectedModListPresets,
   toggleIsCompatCheckingVanillaPacks,
@@ -54,6 +59,7 @@ import {
 } from "../modSources";
 import { selectConfigSavePayload } from "../config/configSavePayload";
 import { hideableMainWindowTabs } from "../utility/frontend/mainWindowTabs";
+import CompressionAnalysis from "./CompressionAnalysis";
 
 const cleanData = () => {
   window.api?.cleanData();
@@ -66,6 +72,23 @@ const cleanSymbolicLinksInData = () => {
 const exportModNamesToClipboard = (enabledMods: Mod[]) => {
   window.api?.exportModNamesToClipboard(enabledMods);
 };
+
+const formatWorkshopStagingBytes = (bytes: number): string => {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Math.max(0, bytes);
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unitIndex]}`;
+};
+
+const formatWorkshopStagingFolderSize = (template: string | undefined, bytes: number): string =>
+  (template || "Folder size: {{size}}").replace("{{size}}", formatWorkshopStagingBytes(bytes));
+
+const formatWorkshopStagingError = (template: string | undefined, fallback: string, detail: string): string =>
+  (template || fallback).replace("{{error}}", detail);
 
 type OptionType = {
   value: string;
@@ -84,9 +107,20 @@ const OptionsDrawer = memo(() => {
   const [isShowingShareMods, setIsShowingShareMods] = useState<boolean>(false);
   const [isShowingSetFolderPaths, setIsShowingSetFolderPaths] = useState<boolean>(false);
   const [isShowingAboutScreen, setIsShowingAboutScreen] = useState<boolean>(false);
+  const [isShowingCompressionAnalysis, setIsShowingCompressionAnalysis] = useState<boolean>(false);
   const [isForceResubscribeConfirmOpen, setIsForceResubscribeConfirmOpen] = useState(false);
   const [modsToForceResubscribe, setModsToForceResubscribe] = useState<Mod[]>([]);
   const [modFolderMessage, setModFolderMessage] = useState("");
+  const [workshopStagingFolderInfo, setWorkshopStagingFolderInfo] = useState({
+    size: 0,
+    hasContents: false,
+  });
+  const [isLoadingWorkshopStagingFolderInfo, setIsLoadingWorkshopStagingFolderInfo] = useState(true);
+  const [isClearingWorkshopStaging, setIsClearingWorkshopStaging] = useState(false);
+  const [workshopStagingFolderMessage, setWorkshopStagingFolderMessage] = useState<{
+    message: string;
+    isError: boolean;
+  }>();
   const [logPathStatus, setLogPathStatus] = useState<{ message: string; isError: boolean }>();
   const [customFolderStatuses, setCustomFolderStatuses] = useState<Record<string, boolean>>({});
   const [syncingCustomFolderId, setSyncingCustomFolderId] = useState<string>();
@@ -100,6 +134,12 @@ const OptionsDrawer = memo(() => {
   const hiddenModNames = useAppSelector((state) => state.app.hiddenModNames);
   const areThumbnailsEnabled = useAppSelector((state) => state.app.areThumbnailsEnabled);
   const isClosedOnPlay = useAppSelector((state) => state.app.isClosedOnPlay);
+  const isWH3Running = useAppSelector((state) => state.app.isWH3Running);
+  const workshopModStagingMode = useAppSelector((state) => state.app.workshopModStagingMode);
+  const compressWorkshopModsOnStart = useAppSelector((state) => state.app.compressWorkshopModsOnStart);
+  const cleanUpWorkshopModStagingAfterGameExit = useAppSelector(
+    (state) => state.app.cleanUpWorkshopModStagingAfterGameExit,
+  );
   const isUsingEnglishLocalizations = useAppSelector((state) => state.app.isUsingEnglishLocalizations);
   const isCompatCheckingVanillaPacks = useAppSelector((state) => state.app.isCompatCheckingVanillaPacks);
   const isAuthorEnabled = useAppSelector((state) => state.app.isAuthorEnabled);
@@ -112,12 +152,15 @@ const OptionsDrawer = memo(() => {
   const isAutoStartCustomBattleEnabled = useAppSelector((state) => state.app.isAutoStartCustomBattleEnabled);
   const isChangingGameProcessPriority = useAppSelector((state) => state.app.isChangingGameProcessPriority);
   const isFeaturesForModdersEnabled = useAppSelector((state) => state.app.isFeaturesForModdersEnabled);
+  const isRigidModelV2CompressionEnabled = useAppSelector((state) => state.app.isRigidModelV2CompressionEnabled);
+  const compressModsOnUpload = useAppSelector((state) => state.app.compressModsOnUpload);
   const moddersPrefix = useAppSelector((state) => state.app.moddersPrefix);
   const skillTreesDisplayMode = useAppSelector((state) => state.app.skillTreesDisplayMode);
   const technologyTreesDisplayMode = useAppSelector((state) => state.app.technologyTreesDisplayMode);
   const hiddenMainWindowTabs = useAppSelector((state) => state.app.hiddenMainWindowTabs);
   const isDev = useAppSelector((state) => state.app.isDev);
   const isAdmin = useAppSelector((state) => state.app.isAdmin);
+  const canCreateSymbolicLinks = useAppSelector((state) => state.app.canCreateSymbolicLinks);
   const availableLanguages = useAppSelector((state) => state.app.availableLanguages);
   const currentLanguage = useAppSelector((state) => state.app.currentLanguage);
   const currentGame = useAppSelector((state) => state.app.currentGame);
@@ -150,6 +193,107 @@ const OptionsDrawer = memo(() => {
   useEffect(() => {
     window.api?.getCustomModFolderStatuses(customModFolders.map((folder) => folder.path)).then(setCustomFolderStatuses);
   }, [customModFolders]);
+
+  const refreshWorkshopStagingFolderInfo = useCallback(async () => {
+    const getWorkshopModStagingInfo = window.api?.getWorkshopModStagingInfo;
+    if (!getWorkshopModStagingInfo) {
+      setIsLoadingWorkshopStagingFolderInfo(false);
+      return;
+    }
+
+    setIsLoadingWorkshopStagingFolderInfo(true);
+    try {
+      const result = await getWorkshopModStagingInfo();
+      if (!result?.success) {
+        setWorkshopStagingFolderInfo({ size: 0, hasContents: false });
+        setWorkshopStagingFolderMessage({
+          message:
+            result?.error ||
+            formatWorkshopStagingError(
+              localized.automaticWorkshopStagingFolderSizeFailed,
+              "Could not read folder size.",
+              "Unknown error",
+            ),
+          isError: true,
+        });
+        return;
+      }
+
+      setWorkshopStagingFolderInfo({
+        size: Math.max(0, result.size || 0),
+        hasContents: result.hasContents ?? (result.size || 0) > 0,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setWorkshopStagingFolderMessage({
+        message: formatWorkshopStagingError(
+          localized.automaticWorkshopStagingFolderSizeFailed,
+          "Could not read folder size.",
+          detail,
+        ),
+        isError: true,
+      });
+    } finally {
+      setIsLoadingWorkshopStagingFolderInfo(false);
+    }
+  }, [localized.automaticWorkshopStagingFolderSizeFailed]);
+
+  useEffect(() => {
+    void refreshWorkshopStagingFolderInfo();
+  }, [currentGame, appFolderPaths.gamePath, isWH3Running, refreshWorkshopStagingFolderInfo, workshopModStagingMode]);
+
+  const clearWorkshopStagingFolder = useCallback(async () => {
+    const clearWorkshopModStaging = window.api?.clearWorkshopModStaging;
+    if (!clearWorkshopModStaging) {
+      setWorkshopStagingFolderMessage({ message: "Workshop staging cleanup is unavailable.", isError: true });
+      return;
+    }
+
+    setIsClearingWorkshopStaging(true);
+    setWorkshopStagingFolderMessage(undefined);
+    try {
+      const result = await clearWorkshopModStaging();
+      if (!result?.success) {
+        setWorkshopStagingFolderMessage({
+          message:
+            result?.code === "GAME_RUNNING"
+              ? localized.automaticWorkshopStagingGameRunning ||
+                "Cannot clear copied Workshop mods while the game is running. Close the game and try again."
+              : result?.error ||
+                formatWorkshopStagingError(
+                  localized.automaticWorkshopStagingClearFailed,
+                  "Could not clear copied Workshop mods.",
+                  "Unknown error",
+                ),
+          isError: true,
+        });
+        return;
+      }
+
+      setWorkshopStagingFolderMessage({
+        message: localized.automaticWorkshopStagingCleared || "Cleared copied Workshop mods.",
+        isError: false,
+      });
+      await refreshWorkshopStagingFolderInfo();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setWorkshopStagingFolderMessage({
+        message: formatWorkshopStagingError(
+          localized.automaticWorkshopStagingClearFailed,
+          "Could not clear copied Workshop mods.",
+          detail,
+        ),
+        isError: true,
+      });
+    } finally {
+      setIsClearingWorkshopStaging(false);
+    }
+  }, [
+    localized.automaticWorkshopStagingClearFailed,
+    localized.automaticWorkshopStagingCleared,
+    localized.automaticWorkshopStagingGameRunning,
+    refreshWorkshopStagingFolderInfo,
+  ]);
 
   const updateCustomModSources = useCallback(
     async (folders: CustomModFolder[], sourceOrder: string[]) => {
@@ -451,6 +595,15 @@ const OptionsDrawer = memo(() => {
     <div>
       <GamePathsSetup isOpen={isShowingSetFolderPaths} setIsOpen={setIsShowingSetFolderPaths}></GamePathsSetup>
       <AboutScreen isOpen={isShowingAboutScreen} setIsOpen={setIsShowingAboutScreen}></AboutScreen>
+      <CompressionAnalysis
+        isOpen={isShowingCompressionAnalysis}
+        onClose={() => setIsShowingCompressionAnalysis(false)}
+        currentGame={currentGame}
+        enabledModPaths={enabledMods.map((mod) => mod.path)}
+        isFeaturesForModdersEnabled={isFeaturesForModdersEnabled}
+        isRigidModelV2CompressionEnabled={isRigidModelV2CompressionEnabled}
+        onRigidModelV2CompressionEnabledChange={(enabled) => dispatch(setIsRigidModelV2CompressionEnabled(enabled))}
+      />
       <ShareMods isOpen={isShowingShareMods} setIsOpen={setIsShowingShareMods} />
       <CreateSteamCollection />
       <ImportSteamCollection />
@@ -542,7 +695,10 @@ const OptionsDrawer = memo(() => {
             role="dialog"
           >
             <div className="mt-6 mb-4 flex items-center justify-between">
-              <h5 id="drawer-label" className="inline-flex items-center text-base font-semibold text-gray-500 dark:text-gray-400 cursor-default">
+              <h5
+                id="drawer-label"
+                className="inline-flex items-center text-base font-semibold text-gray-500 dark:text-gray-400 cursor-default"
+              >
                 {localized.otherOptions}
               </h5>
               <button
@@ -696,54 +852,47 @@ const OptionsDrawer = memo(() => {
                 "Split the All Mods tab into two lists: disabled mods on the left, enabled mods on the right. Click a mod to move it between them."}
             </p>
 
-            {/* Both sub-options only bite in the dual layout, so they follow its checkbox and grey out with it. */}
-            <div className={"ml-6 mt-3 " + (isDualModListLayoutEnabled ? "" : "opacity-40")}>
-              <label className="block mb-1" htmlFor="modListDensity">
-                {localized.modListDensity || "Row Size"}
-              </label>
-              <FormSelect
-                id="modListDensity"
-                disabled={!isDualModListLayoutEnabled}
-                value={modListDensity}
-                onChange={(event) => dispatch(setModListDensity(event.target.value as ModListDensity))}
-              >
-                {modListDensityOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </FormSelect>
-              <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                {localized.modListDensityHelp ||
-                  "How much room each mod gets in the two lists. Larger rows are easier to read but fewer fit on screen."}
-              </p>
-            </div>
+            {isDualModListLayoutEnabled && (
+              <>
+                <div className="ml-6 mt-3">
+                  <label className="block mb-1" htmlFor="modListDensity">
+                    {localized.modListDensity || "Row Size"}
+                  </label>
+                  <FormSelect
+                    id="modListDensity"
+                    value={modListDensity}
+                    onChange={(event) => dispatch(setModListDensity(event.target.value as ModListDensity))}
+                  >
+                    {modListDensityOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </FormSelect>
+                  <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                    {localized.modListDensityHelp ||
+                      "How much room each mod gets in the two lists. Larger rows are easier to read but fewer fit on screen."}
+                  </p>
+                </div>
 
-            {/* Only affects the disabled list, which exists solely in the dual layout. */}
-            <div className={"flex items-center ml-6 mt-3 " + (isDualModListLayoutEnabled ? "" : "opacity-40")}>
-              <input
-                className="mt-1"
-                type="checkbox"
-                id="show-disabled-mods-load-order"
-                disabled={!isDualModListLayoutEnabled}
-                checked={!!isShowingDisabledModsLoadOrder}
-                onChange={() => dispatch(toggleIsShowingDisabledModsLoadOrder())}
-              ></input>
-              <label
-                className={"ml-2 mt-1 " + (isDualModListLayoutEnabled ? "" : "cursor-not-allowed")}
-                htmlFor="show-disabled-mods-load-order"
-              >
-                {localized.showDisabledModsLoadOrder || "Number The Disabled Mods List"}
-              </label>
-            </div>
-            <p
-              className={
-                "ml-6 mt-1 text-sm text-gray-500 dark:text-gray-400 " + (isDualModListLayoutEnabled ? "" : "opacity-40")
-              }
-            >
-              {localized.showDisabledModsLoadOrderHelp ||
-                "A disabled mod's position is its rank among all mods, which is not where it lands once enabled. Load orders you have pinned are shown either way."}
-            </p>
+                <div className="flex items-center ml-6 mt-3">
+                  <input
+                    className="mt-1"
+                    type="checkbox"
+                    id="show-disabled-mods-load-order"
+                    checked={!!isShowingDisabledModsLoadOrder}
+                    onChange={() => dispatch(toggleIsShowingDisabledModsLoadOrder())}
+                  ></input>
+                  <label className="ml-2 mt-1" htmlFor="show-disabled-mods-load-order">
+                    {localized.showDisabledModsLoadOrder || "Number The Disabled Mods List"}
+                  </label>
+                </div>
+                <p className="ml-6 mt-1 text-sm text-gray-500 dark:text-gray-400">
+                  {localized.showDisabledModsLoadOrderHelp ||
+                    "A disabled mod's position is its rank among all mods, which is not where it lands once enabled. Load orders you have pinned are shown either way."}
+                </p>
+              </>
+            )}
 
             <h6 className="mt-6">{localized.extraColumns}</h6>
             <div className="flex items-center ml-1">
@@ -1024,6 +1173,151 @@ const OptionsDrawer = memo(() => {
               </button>
             </div>
 
+            <h6 className="mt-8">{localized.automaticWorkshopStagingTitle || "Automatic Workshop Mod Staging"}</h6>
+            <p className="mb-4 text-sm text-gray-500 dark:text-gray-400">
+              {localized.automaticWorkshopStagingHelp ||
+                "This is the automatic launch-time alternative to the copy and symbolic-link tools above. It prepares enabled Workshop mods in game_folder/whmm_copied_mods."}
+            </p>
+
+            <fieldset className="mb-3 rounded border border-gray-600 p-3 text-sm">
+              <legend className="px-1 font-medium text-gray-200">
+                {localized.automaticWorkshopStagingMode || "On game start"}
+              </legend>
+              <div className="space-y-2">
+                <label className="flex cursor-pointer items-center rounded px-2 py-2 hover:bg-gray-700/50">
+                  <input
+                    type="radio"
+                    name="automatic-workshop-staging-mode"
+                    id="disable-automatic-workshop-staging"
+                    checked={workshopModStagingMode === "disabled"}
+                    onChange={() => dispatch(setWorkshopModStagingMode("disabled"))}
+                  />
+                  <span className="ml-3">{localized.automaticWorkshopStagingDisabled || "Off"}</span>
+                </label>
+                <label className="flex cursor-pointer items-center rounded px-2 py-2 hover:bg-gray-700/50">
+                  <input
+                    type="radio"
+                    name="automatic-workshop-staging-mode"
+                    id="automatically-copy-workshop-mods-on-start"
+                    aria-label={localized.automaticallyCopyWorkshopModsOnStart || "Copy mod files"}
+                    checked={workshopModStagingMode === "copy"}
+                    onChange={() => dispatch(setWorkshopModStagingMode("copy"))}
+                  />
+                  <span className="ml-3 flex min-w-0 flex-1 items-center justify-between gap-2">
+                    <span>{localized.automaticallyCopyWorkshopModsOnStart || "Copy mod files"}</span>
+                    {(isLoadingWorkshopStagingFolderInfo || workshopStagingFolderInfo.size > 0) && (
+                      <span className="shrink-0 text-xs text-gray-400">
+                        {isLoadingWorkshopStagingFolderInfo
+                          ? "…"
+                          : formatWorkshopStagingFolderSize(
+                              localized.automaticWorkshopStagingFolderSize,
+                              workshopStagingFolderInfo.size,
+                            )}
+                      </span>
+                    )}
+                  </span>
+                </label>
+                <label
+                  className={
+                    "flex items-center rounded px-2 py-2 " +
+                    (canCreateSymbolicLinks ? "cursor-pointer hover:bg-gray-700/50" : "cursor-not-allowed opacity-50")
+                  }
+                >
+                  <input
+                    type="radio"
+                    name="automatic-workshop-staging-mode"
+                    id="automatically-link-workshop-mods-on-start"
+                    checked={workshopModStagingMode === "symlink"}
+                    disabled={!canCreateSymbolicLinks}
+                    onChange={() => dispatch(setWorkshopModStagingMode("symlink"))}
+                  />
+                  <span className="ml-3">
+                    {localized.automaticallyCopySymbolicLinksOnStart || "Create symbolic links"}
+                  </span>
+                </label>
+              </div>
+              {workshopStagingFolderInfo.hasContents && (
+                <div className="mt-2 border-t border-gray-600 px-2 pt-2">
+                  <button
+                    type="button"
+                    className="rounded border border-gray-600 bg-gray-800 px-3 py-1.5 text-xs font-medium uppercase text-gray-200 hover:bg-gray-700 focus:outline-none focus:ring-1 focus:ring-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={isClearingWorkshopStaging}
+                    onClick={clearWorkshopStagingFolder}
+                  >
+                    {isClearingWorkshopStaging
+                      ? localized.automaticWorkshopStagingClearing || "Clearing…"
+                      : localized.automaticWorkshopStagingClearFolder || "Clear copied mods"}
+                  </button>
+                  {isWH3Running && (
+                    <p className="mt-2 text-xs text-amber-300">
+                      {localized.automaticWorkshopStagingClearHelp ||
+                        "Clearing these copied packs will fail while the game is running. Close the game before clearing this folder."}
+                    </p>
+                  )}
+                </div>
+              )}
+              {workshopStagingFolderMessage && (
+                <p
+                  className={`mt-2 px-2 text-xs ${
+                    workshopStagingFolderMessage.isError ? "text-red-400" : "text-green-400"
+                  }`}
+                  role={workshopStagingFolderMessage.isError ? "alert" : "status"}
+                >
+                  {workshopStagingFolderMessage.message}
+                </p>
+              )}
+              {!canCreateSymbolicLinks && (
+                <p className="mt-2 px-2 text-xs text-red-400">
+                  {localized.automaticWorkshopSymlinkUnavailable ||
+                    "Symbolic-link staging requires administrator access or Windows Developer Mode."}
+                </p>
+              )}
+
+              {currentGame === "wh3" && workshopModStagingMode === "copy" && (
+                <div className="mt-3 border-t border-gray-600 pt-3">
+                  <label className="flex cursor-pointer items-start px-2">
+                    <input
+                      className="mt-1"
+                      type="checkbox"
+                      id="compress-workshop-mods-on-start"
+                      checked={!!compressWorkshopModsOnStart}
+                      onChange={() => dispatch(toggleCompressWorkshopModsOnStart())}
+                    />
+                    <span className="ml-3">
+                      <span className="block">{localized.compressWorkshopModsOnStart || "Compress mods"}</span>
+                      <span className="mt-1 block text-xs text-gray-400">
+                        {localized.compressWorkshopModsHelp ||
+                          "Copies the pack, then compresses eligible files in the staged copy."}
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
+
+              {workshopModStagingMode !== "disabled" && (
+                <div className="mt-3 border-t border-gray-600 pt-3">
+                  <label className="flex cursor-pointer items-start px-2">
+                    <input
+                      className="mt-1"
+                      type="checkbox"
+                      id="clean-up-workshop-mods-after-game-exit"
+                      checked={!!cleanUpWorkshopModStagingAfterGameExit}
+                      onChange={() => dispatch(toggleCleanUpWorkshopModStagingAfterGameExit())}
+                    />
+                    <span className="ml-3">
+                      <span className="block">
+                        {localized.cleanUpWorkshopModsAfterGameExit || "Clean up after game exit"}
+                      </span>
+                      <span className="mt-1 block text-xs text-gray-400">
+                        {localized.cleanUpWorkshopModsHelp ||
+                          "Applies to both copy and symbolic-link modes and removes staged mods after the game closes."}
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
+            </fieldset>
+
             <h6 className="mt-10">{localized.hiddenMods}</h6>
             <p className="mb-3 text-sm text-gray-500 dark:text-gray-400">{localized.unhideMods}</p>
 
@@ -1071,7 +1365,7 @@ const OptionsDrawer = memo(() => {
 
             {gameToSupportedGameOptions[currentGame].length > 0 && (
               <>
-                <h6 className="mt-10">{localized.forModders}</h6>
+                <h6 className="mt-10">{localized.gameStartParameters || "Game Start Parameters"}</h6>
                 <p className="mb-1 text-sm text-gray-500 dark:text-red-500">{localized.keepInSync}</p>
                 {gameToSupportedGameOptions[currentGame].includes("MakeUnitsGenerals") && (
                   <div className="flex items-center ml-1 mt-2">
@@ -1184,60 +1478,82 @@ const OptionsDrawer = memo(() => {
                     </Tooltip>
                   </label>
                 </div>
-                <div className="flex items-center ml-1 mt-2">
-                  <input
-                    className=""
-                    type="checkbox"
-                    id="toggleIsFeaturesForModdersEnabled"
-                    checked={!!isFeaturesForModdersEnabled}
-                    onChange={() => {
-                      dispatch(toggleIsFeaturesForModdersEnabled());
-                      const newValue = !isFeaturesForModdersEnabled;
-                      window.api?.syncIsFeaturesForModdersEnabled(newValue);
-                    }}
-                  ></input>
-                  <label className="ml-2" htmlFor="toggleIsFeaturesForModdersEnabled">
-                    <Tooltip
-                      placement="bottom"
-                      style="light"
-                      content={
-                        <>
-                          <div>
-                            {localized.featuresForModdersHelp ||
-                              "Enables features inside the Mod Manager intended for modders."}
-                          </div>
-                        </>
-                      }
-                    >
-                      {localized.featuresForModders || "Features For Modders"}
-                    </Tooltip>
-                  </label>
-                </div>
-                {isFeaturesForModdersEnabled && (
-                  <div className="ml-7 mt-3">
-                    <label
-                      className="block text-sm font-medium text-gray-900 dark:text-gray-100"
-                      htmlFor="moddersPrefix"
-                    >
-                      {localized.prefixForModders || "Prefix For Modders"}
-                    </label>
-                    <input
-                      id="moddersPrefix"
-                      type="text"
-                      value={moddersPrefix}
-                      onChange={(event) => {
-                        dispatch(setModdersPrefix(event.target.value));
-                        window.api?.syncModdersPrefix(event.target.value);
-                      }}
-                      className="mt-2 block w-full max-w-md rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:outline-none dark:border-gray-600 dark:bg-gray-700 dark:text-white"
-                    />
-                    <p className="mt-2 max-w-md text-sm text-gray-500 dark:text-gray-400">
-                      {localized.prefixForModdersDescription ||
-                        "Use this prefix as default when auto-generating database keys and table names."}
-                    </p>
-                  </div>
-                )}
               </>
+            )}
+
+            <h6 className="mt-10">{localized.forModders}</h6>
+            <div className="flex items-center ml-1 mt-2">
+              <input
+                className=""
+                type="checkbox"
+                id="toggleIsFeaturesForModdersEnabled"
+                checked={!!isFeaturesForModdersEnabled}
+                onChange={() => {
+                  dispatch(toggleIsFeaturesForModdersEnabled());
+                  const newValue = !isFeaturesForModdersEnabled;
+                  window.api?.syncIsFeaturesForModdersEnabled(newValue);
+                }}
+              ></input>
+              <label className="ml-2" htmlFor="toggleIsFeaturesForModdersEnabled">
+                <Tooltip
+                  placement="bottom"
+                  style="light"
+                  content={
+                    <>
+                      <div>
+                        {localized.featuresForModdersHelp ||
+                          "Enables features inside the Mod Manager intended for modders."}
+                      </div>
+                    </>
+                  }
+                >
+                  {localized.featuresForModders || "Features For Modders"}
+                </Tooltip>
+              </label>
+            </div>
+            <label
+              className={
+                "ml-1 mt-3 flex items-start " +
+                (currentGame === "wh3" ? "cursor-pointer" : "cursor-not-allowed opacity-50")
+              }
+              htmlFor="compress-mods-on-upload"
+            >
+              <input
+                className="mt-1"
+                type="checkbox"
+                id="compress-mods-on-upload"
+                checked={!!compressModsOnUpload}
+                disabled={currentGame !== "wh3"}
+                onChange={() => dispatch(toggleCompressModsOnUpload())}
+              />
+              <span className="ml-3">
+                <span className="block">{localized.compressModsOnUpload || "Compress mod on upload"}</span>
+                <span className="mt-1 block text-xs text-gray-400">
+                  {localized.compressModsOnUploadDescription ||
+                    "Compresses the pack before updating it on the Steam Workshop and backs up the original in whmm_backups."}
+                </span>
+              </span>
+            </label>
+            {isFeaturesForModdersEnabled && (
+              <div className="ml-7 mt-3">
+                <label className="block text-sm font-medium text-gray-900 dark:text-gray-100" htmlFor="moddersPrefix">
+                  {localized.prefixForModders || "Prefix For Modders"}
+                </label>
+                <input
+                  id="moddersPrefix"
+                  type="text"
+                  value={moddersPrefix}
+                  onChange={(event) => {
+                    dispatch(setModdersPrefix(event.target.value));
+                    window.api?.syncModdersPrefix(event.target.value);
+                  }}
+                  className="mt-2 block w-full max-w-md rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:outline-none dark:border-gray-600 dark:bg-gray-700 dark:text-white"
+                />
+                <p className="mt-2 max-w-md text-sm text-gray-500 dark:text-gray-400">
+                  {localized.prefixForModdersDescription ||
+                    "Use this prefix as default when auto-generating database keys and table names."}
+                </p>
+              </div>
             )}
 
             <div className="mt-4 max-w-md">
@@ -1370,6 +1686,42 @@ const OptionsDrawer = memo(() => {
                 <span className="uppercase">{localized.searchInsidePacks}</span>
               </button>
             </div>
+
+            {isFeaturesForModdersEnabled && (
+              <>
+                <h6 className="mt-10">{localized.compressionAnalysis || "Compression Analysis"}</h6>
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  {localized.compressionAnalysisDescription ||
+                    "Benchmark currently enabled Warhammer 3 mod packs and optionally compress them."}
+                </p>
+                <div className="flex mt-2 w-full">
+                  <button
+                    type="button"
+                    disabled={currentGame !== "wh3" || enabledMods.length === 0}
+                    title={
+                      currentGame !== "wh3"
+                        ? localized.compressionAnalysisOnlyWH3 ||
+                          "Compression analysis is available for Warhammer 3 only."
+                        : enabledMods.length === 0
+                          ? localized.compressionAnalysisNoEnabledMods || "Enable at least one mod first."
+                          : undefined
+                    }
+                    className="make-tooltip-w-full inline-block px-6 py-2.5 bg-purple-600 text-white font-medium text-xs leading-tight rounded shadow-md hover:bg-purple-700 hover:shadow-lg focus:bg-purple-700 focus:shadow-lg focus:outline-none focus:ring-0 active:bg-purple-800 active:shadow-lg transition duration-150 ease-in-out m-auto w-[70%] disabled:cursor-not-allowed disabled:opacity-40"
+                    onClick={() => setIsShowingCompressionAnalysis(true)}
+                  >
+                    <span className="uppercase">{localized.compressionAnalysis || "Compression Analysis"}</span>
+                  </button>
+                  {(currentGame !== "wh3" || enabledMods.length === 0) && (
+                    <p className="mt-2 text-center text-xs text-yellow-200">
+                      {currentGame !== "wh3"
+                        ? localized.compressionAnalysisOnlyWH3 ||
+                          "Compression analysis is available for Warhammer 3 only."
+                        : localized.compressionAnalysisNoEnabledMods || "Enable at least one mod first."}
+                    </p>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         </Drawer>
       )}

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   getFilteredMods,
@@ -6,11 +6,15 @@ import {
   getModsSortedByEnabled,
   getModsSortedByAuthor,
   getModsSortedByHumanName,
+  getModsSortedByName,
   getModSortName,
   getSparseLoadOrderByModName,
   sortModsAsInEntries,
   sortByNameAndLoadOrder,
+  resetActiveLoadOrderEdges,
+  setActiveLoadOrderEdges,
 } from "../src/modSortingHelpers";
+import { buildLoadOrderEdges } from "../src/loadOrderRules";
 
 const createMod = (overrides: Partial<Mod>): Mod =>
   ({
@@ -110,6 +114,14 @@ describe("getFilteredMods", () => {
   });
 });
 
+describe("sorting by pack name", () => {
+  it("keeps the natural alphanumeric case ordering", () => {
+    const mods = [createMod({ name: "aaa.pack" }), createMod({ name: "AAA.pack" })];
+
+    expect(getModsSortedByName(mods).map((mod) => mod.name)).toEqual(["AAA.pack", "aaa.pack"]);
+  });
+});
+
 describe("sorting by the human name", () => {
   const createTitledMod = (name: string, humanName: string) => createMod({ name, humanName });
 
@@ -203,5 +215,65 @@ describe("sorting by the author", () => {
     const mods = [createAuthoredMod("b.pack", "Zed"), createAuthoredMod("a.pack", "Zed")];
 
     expect(sortedNames(mods)).toEqual(["a.pack", "b.pack"]);
+  });
+});
+
+describe("sortByNameAndLoadOrder with rules", () => {
+  /** Every rule here positions its `before` pack; that pack is the only one the sort may move. */
+  const buildEdges = (rules: { before: string; after: string }[]) =>
+    buildLoadOrderEdges(rules.map((rule) => ({ ...rule, subjectPackName: rule.before })));
+  const namesOf = (mods: Mod[]) => mods.map((mod) => mod.name);
+
+  afterEach(() => {
+    resetActiveLoadOrderEdges();
+  });
+
+  it("orders by name alone when no rules are set", () => {
+    const mods = [createMod({ name: "c.pack" }), createMod({ name: "a.pack" }), createMod({ name: "b.pack" })];
+    expect(namesOf(sortByNameAndLoadOrder(mods))).toEqual(["a.pack", "b.pack", "c.pack"]);
+  });
+
+  it("swaps two unpinned mods a rule constrains", () => {
+    const mods = [createMod({ name: "a.pack" }), createMod({ name: "b.pack" }), createMod({ name: "c.pack" })];
+    const edges = buildEdges([{ before: "c.pack", after: "a.pack" }]);
+
+    expect(namesOf(sortByNameAndLoadOrder(mods, edges))).toEqual(["c.pack", "a.pack", "b.pack"]);
+  });
+
+  it("keeps a manually pinned mod at its position even when a rule wants it elsewhere", () => {
+    const mods = [
+      createMod({ name: "a.pack", loadOrder: 0 }),
+      createMod({ name: "b.pack" }),
+      createMod({ name: "c.pack" }),
+    ];
+    // The rule asks for c before a, but a is pinned to the very top and pins win.
+    const edges = buildEdges([{ before: "c.pack", after: "a.pack" }]);
+
+    expect(namesOf(sortByNameAndLoadOrder(mods, edges))[0]).toBe("a.pack");
+  });
+
+  it("still orders the unpinned mods by rule around a pin", () => {
+    const mods = [
+      createMod({ name: "a.pack", loadOrder: 0 }),
+      createMod({ name: "b.pack" }),
+      createMod({ name: "c.pack" }),
+    ];
+    const edges = buildEdges([{ before: "c.pack", after: "b.pack" }]);
+
+    expect(namesOf(sortByNameAndLoadOrder(mods, edges))).toEqual(["a.pack", "c.pack", "b.pack"]);
+  });
+
+  it("reads rules from the ambient registry when none are passed", () => {
+    const mods = [createMod({ name: "a.pack" }), createMod({ name: "b.pack" })];
+    setActiveLoadOrderEdges(buildEdges([{ before: "b.pack", after: "a.pack" }]));
+
+    expect(namesOf(sortByNameAndLoadOrder(mods))).toEqual(["b.pack", "a.pack"]);
+  });
+
+  it("lets an explicitly passed edge set override the registry", () => {
+    const mods = [createMod({ name: "a.pack" }), createMod({ name: "b.pack" })];
+    setActiveLoadOrderEdges(buildEdges([{ before: "b.pack", after: "a.pack" }]));
+
+    expect(namesOf(sortByNameAndLoadOrder(mods, buildEdges([])))).toEqual(["a.pack", "b.pack"]);
   });
 });

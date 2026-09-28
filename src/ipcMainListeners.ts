@@ -25,6 +25,10 @@ import type { PackFileRenameEntry } from "./utility/packFileRenamePlan";
 import { resolveExportOutputPath } from "./utility/exportPaths";
 import { buildRpfmTsvContent, getRpfmTsvExportPath } from "./utility/rpfmTsv";
 import { buildImportedPackedFile } from "./utility/packImportStaging";
+import { applyTextPackedFileEdit } from "./utility/textPackStaging";
+import { compareFilesByteForByte } from "./utility/fileComparison";
+import { invalidateCustomizableModPath } from "./utility/customizableModsState";
+import { encodeDdsAsPng } from "./esfMap/dds";
 import { createInFlightTableRequests } from "./components/viewer/inFlightTableRequests";
 import { createSerializedBuilds } from "./utility/serializedBuilds";
 import { createPackReadRegistry } from "./utility/packReadRegistry";
@@ -52,10 +56,8 @@ import {
   type BuiltUnitViewerData,
   type UnitViewerTableRows,
 } from "./unitViewer/data";
-import {
-  loadUnitViewerDiskCache,
-  saveUnitViewerDiskCache,
-} from "./unitViewer/cache";
+import { loadUnitViewerDiskCache, saveUnitViewerDiskCache } from "./unitViewer/cache";
+import { buildVariantMeshCatalog, type VariantMeshCatalog } from "./visuals/variantMesh";
 import {
   buildBuildingsData,
   buildVariantNameLocKey,
@@ -145,17 +147,14 @@ import type {
 import {
   clearEsfMapMemoryCache,
   loadEsfMapDiskCache,
+  resolveEsfMapCachedImage,
   saveEsfMapDiskCache,
 } from "./esfMap/cache";
-import {
-  getVanillaStartposFilePaths,
-  loadEsfMapData,
-  loadStartposRegionSlotTemplates,
-} from "./esfMap/loader";
+import { getVanillaStartposFilePaths, loadEsfMapData, loadStartposRegionSlotTemplates } from "./esfMap/loader";
 import { addClimateDataToEsfMap } from "./esfMap/climates";
 import { addFactionDataToEsfMap, factionFlagPath } from "./esfMap/factions";
 import { addSettlementTypeDataToEsfMap } from "./esfMap/settlementTypes";
-import type { EsfMapResponse } from "./esfMap/types";
+import type { EsfMapDiplomacyIconUrls, EsfMapResponse } from "./esfMap/types";
 import { getVanillaLocalisationPackPaths as getVanillaLocalisationPackPathsFor } from "./vanillaLocCache/packs";
 import {
   VanillaLocCacheBuildCanceled,
@@ -192,6 +191,14 @@ import {
   type VisualsTableContribution,
   type VisualsVanillaSignatureInputs,
 } from "./visuals/cache";
+import { toVariantMeshDefinitionPath } from "./visuals/paths";
+import {
+  collectVisualDependencyClosure,
+  getSupportedVisualDependencyExtension,
+  getSupportedVisualReferences,
+  getVisualMaterialFactionTextures,
+  type VisualDependencyClosure,
+} from "./visuals/dependencies";
 import {
   canUseVanillaDbCacheForPack,
   closeVanillaDbCacheReaders,
@@ -267,6 +274,7 @@ import {
 } from "./modFunctions";
 import {
   DATA_MOD_SOURCE_ID,
+  getModSourceId,
   getWorkshopModSyncItems,
   insertCustomSourceAfterData,
   isWorkshopMod,
@@ -298,6 +306,7 @@ import {
   mergeMods,
   readFromExistingPack,
   forEachPackedFileBuffer,
+  decompressPackedPayload,
   readPack,
   resolveKeyValue,
   serializePackFileDataToBuffer,
@@ -362,8 +371,10 @@ import {
 import { normalizeAssetPath } from "./assetUrls";
 import { forkSteamWorker as fork, terminateSteamWorker } from "./steamWorker";
 import {
+  collectVanillaPackTreeChildren,
   collectVanillaFilesUnderPrefix,
   findVanillaPackContaining,
+  searchVanillaPackFileTree,
 } from "./vanillaPackIndex/format";
 import {
   selectPackPathsToSearch,
@@ -373,12 +384,23 @@ import {
 import { getVanillaPackIndex } from "./vanillaPackIndex/store";
 import { getVanillaPackPathsInLoadOrder } from "./utility/vanillaPackPaths";
 import {
+  getPackedFileNamesFromCacheEntry,
+  getCurrentPackFilesCacheEntry,
+  getVanillaPackFilesCacheEntry,
+  getCachedVanillaPackIndexFromEntry,
+  loadVanillaPackFilesCache,
+  rememberPackFileNames,
+  saveVanillaPackFilesCache,
+} from "./vanillaPackFilesCache";
+import { addRecentPackPath, recentPackPathsEqual, sanitizeRecentPackPaths } from "./utility/recentPackPaths";
+import {
   gameToGameName,
   gameToPackWithDBTablesName,
   gameToProcessName,
   gameToSteamId,
   gameToSupportedGameOptions,
   gameToVanillaPacksData,
+  vanillaPackNames,
   supportedGameOptions,
   supportedGameOptionToStartGameOption,
   supportsCompression,
@@ -393,12 +415,40 @@ import {
   decodePackedTextBuffer,
   getPackedFileMimeType,
   getPackedFileViewerKind,
+  isDdsPackedFilePath,
 } from "./utility/packFileViewing";
+import { refreshMainLoadOrderRules } from "./mainLoadOrderRules";
+import { replaceModLoadOrderRules } from "./loadOrderRules";
+import {
+  isLoadOrderRulesPackedFilePath,
+  LOAD_ORDER_RULES_PACKED_FILE_PATH,
+  parseLoadOrderRulesFile,
+} from "./utility/loadOrderRulesFile";
 import { collator } from "./utility/packFileSorting";
 import { launchGame, resolveGameLaunchPlan } from "./utility/gameLaunch";
+import {
+  cleanupWorkshopModStaging,
+  getWorkshopModStagingFolderInfo,
+  buildWorkshopStagingWorkingDirectoryLines,
+  stageWorkshopMods,
+  WorkshopModStagingError,
+  WORKSHOP_MOD_STAGING_FOLDER,
+  type WorkshopStagingProgress,
+  type WorkshopStagingResult,
+} from "./utility/workshopModStaging";
+import { findGameProcessIds } from "./utility/gameProcess";
 import { packFileContains } from "./utility/packSearch";
 import steamCollectionScript from "./utility/steamCollectionScript";
 import Trie, { type KeyedLookup } from "./utility/trie";
+import {
+  analyzeCompressionPacks,
+  compressAnalyzedPack,
+  type CompressionAnalysisProgress,
+  type CompressionAnalysisRequest,
+  type CompressionAnalysisResult,
+  type CompressPackRequest,
+  type CompressPackResponse,
+} from "./compressionAnalysis";
 import hash from "object-hash";
 import { Md10K } from "react-icons/md";
 import { join } from "path";
@@ -519,6 +569,59 @@ export const windows = {
   techTreesWindow: undefined as BrowserWindow | undefined,
 };
 
+let workshopCleanupInFlight: Promise<void> | undefined;
+
+const formatWorkshopStagingBytes = (bytes: number) => {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Math.max(0, bytes);
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unitIndex]}`;
+};
+
+const reportWorkshopCleanupWarning = (message: string, error?: unknown) => {
+  if (error === undefined) console.warn(message);
+  else console.error(message, error);
+  windows.mainWindow?.webContents.send("handleLog", message);
+  windows.mainWindow?.webContents.send("addToast", {
+    type: "warning",
+    messages: [message],
+    startTime: Date.now(),
+  } as Toast);
+};
+
+const reportWorkshopCleanupFailure = (error: unknown) => {
+  const detail = error instanceof Error ? error.message : String(error);
+  const message = i18n.t("automaticWorkshopStagingCleanupFailed", { error: detail });
+  reportWorkshopCleanupWarning(message, error);
+};
+
+/** Removes a previous launch's manager-owned staging folder after the game has stopped. */
+export const cleanupWorkshopStagingAfterGameExit = async (): Promise<void> => {
+  if (appData.isWH3Running || !appData.workshopStagingCleanupPending || !appData.workshopStagingCleanupGamePath) {
+    return;
+  }
+  if (workshopCleanupInFlight) return workshopCleanupInFlight;
+
+  const gamePath = appData.workshopStagingCleanupGamePath;
+  workshopCleanupInFlight = cleanupWorkshopModStaging(gamePath)
+    .then(() => {
+      appData.workshopStagingCleanupPending = false;
+      appData.workshopStagingCleanupGamePath = undefined;
+      console.log(`Cleaned ${WORKSHOP_MOD_STAGING_FOLDER} after game exit.`);
+    })
+    .catch((error) => {
+      reportWorkshopCleanupFailure(error);
+    })
+    .finally(() => {
+      workshopCleanupInFlight = undefined;
+    });
+  return workshopCleanupInFlight;
+};
+
 setVanillaDbCacheBuildProgressReporter((progress) => {
   for (const targetWindow of Object.values(windows)) {
     if (
@@ -538,6 +641,8 @@ type VisualsSession = {
   fileSearchPackPaths: string[];
   visualFiles?: VisualsFileResult[];
   visualFilesPromise?: Promise<VisualsFileResult[]>;
+  /** Parsed VMD catalogs shared by the Visuals tab preview. */
+  variantMeshCatalogs: Map<string, Promise<VariantMeshCatalog>>;
   createdAt: number;
 };
 type UnitViewerSession = {
@@ -553,6 +658,8 @@ type UnitViewerSession = {
   pendingAssets: Map<string, Promise<AssetBytes | undefined>>;
   /** A batch read in flight, which single asset requests wait behind rather than race. */
   pendingPrewarm?: Promise<unknown>;
+  /** Parsed VMD catalogs, shared by animation/export requests for this unit-viewer session. */
+  variantMeshCatalogs: Map<string, Promise<VariantMeshCatalog>>;
   createdAt: number;
 };
 const unitViewerSessions = new Map<string, UnitViewerSession>();
@@ -575,6 +682,8 @@ type CachedBuildingsData = {
   buildingIconPaths: string[];
   icons: Record<string, AssetBytes>;
   iconGeneration: number;
+  /** Runtime URLs for the extended map's diplomacy controls. */
+  diplomacyIconUrls: EsfMapDiplomacyIconUrls;
 };
 let cachedBuildingsData: CachedBuildingsData | undefined;
 type CachedAncillariesData = {
@@ -591,92 +700,30 @@ type CachedAncillariesData = {
   iconGeneration: number;
 };
 let cachedAncillariesData: CachedAncillariesData | undefined;
-let cachedEsfMapData:
-  | { signature: string; data: import("./esfMap/types").EsfMapPayload }
-  | undefined;
-// Cache for vanilla pack file name lists, keyed by pack path.
-// Allows skipping readPack() on startup when the pack hasn't changed. Module scope rather than
-// inside registerIpcMainListeners so anything that only needs a pack's file names - the buildings
-// icon scan, for one - can reuse it instead of reading the pack again.
-interface VanillaPackFilesCacheEntry {
-  size: number;
-  lastChangedLocal: number;
-  packedFileNames: string[];
-}
-type VanillaPackFilesCache = Record<string, VanillaPackFilesCacheEntry>;
-const VANILLA_PACK_FILES_CACHE_FILE = "vanilla-pack-files-cache.bin";
-let vanillaPackFilesCache: VanillaPackFilesCache | null = null;
-const loadVanillaPackFilesCache = async (): Promise<VanillaPackFilesCache> => {
-  if (vanillaPackFilesCache !== null) return vanillaPackFilesCache;
-  try {
-    const cacheFilePath = nodePath.join(
-      app.getPath("userData"),
-      VANILLA_PACK_FILES_CACHE_FILE,
-    );
-    const compressed = await fs.promises.readFile(cacheFilePath);
-    const json = await zstdDecompress(compressed);
-    vanillaPackFilesCache = JSON.parse(
-      json.toString("utf8"),
-    ) as VanillaPackFilesCache;
-    return vanillaPackFilesCache!;
-  } catch {
-    vanillaPackFilesCache = {};
-    return vanillaPackFilesCache;
-  }
-};
-const saveVanillaPackFilesCache = async (): Promise<void> => {
-  if (!vanillaPackFilesCache) return;
-  try {
-    const cacheFilePath = nodePath.join(
-      app.getPath("userData"),
-      VANILLA_PACK_FILES_CACHE_FILE,
-    );
-    const json = Buffer.from(JSON.stringify(vanillaPackFilesCache), "utf8");
-    const compressed = await zstdCompress(json, 1);
-    await fs.promises.writeFile(cacheFilePath, compressed);
-  } catch (err) {
-    console.error("Failed to save vanilla pack files cache:", err);
-  }
-};
-
+let cachedEsfMapData: { signature: string; data: import("./esfMap/types").EsfMapPayload } | undefined;
 /**
- * A pack's file names, from the cache when its size and mtime still match.
+ * A pack's file names, from the expanded vanilla cache or names-only v2 entries for mods when its
+ * size and mtime still match.
  *
  * The names are all an icon lookup needs, and reading a pack just to list them costs a full index
  * parse per pack - about 260 of them for wh3. Populates the cache for packs the startup path never
  * touched, so the second call in a session is free.
  */
-const getVanillaPackedFileNames = async (
-  packPath: string,
-): Promise<string[]> => {
-  const cache = await loadVanillaPackFilesCache();
-  let stat: fs.Stats | undefined;
-  try {
-    stat = await fs.promises.stat(packPath);
-  } catch {
-    return [];
-  }
-  const entry = cache[packPath];
-  if (
-    entry &&
-    entry.size === stat.size &&
-    entry.lastChangedLocal === stat.mtimeMs
-  )
-    return entry.packedFileNames;
+const getVanillaPackedFileNames = async (packPath: string): Promise<string[]> => {
+  const cachedEntry = await getCurrentPackFilesCacheEntry(packPath);
+  if (cachedEntry) return getPackedFileNamesFromCacheEntry(cachedEntry);
 
   const alreadyRead = appData.packsData.find((pack) => pack.path == packPath);
   const packedFileNames = alreadyRead
     ? alreadyRead.packedFiles.map((packedFile) => packedFile.name)
-    : (await readPack(packPath, { skipParsingTables: true })).packedFiles.map(
-        (packedFile) => packedFile.name,
-      );
-
-  cache[packPath] = {
-    size: stat.size,
-    lastChangedLocal: stat.mtimeMs,
-    packedFileNames,
-  };
-  await saveVanillaPackFilesCache();
+    : (await readPack(packPath, { skipParsingTables: true })).packedFiles.map((packedFile) => packedFile.name);
+  try {
+    const stat = await fs.promises.stat(packPath);
+    rememberPackFileNames(packPath, stat.size, stat.mtimeMs, packedFileNames);
+    await saveVanillaPackFilesCache();
+  } catch {
+    // The caller already has the names; a disappearing pack only prevents persistence.
+  }
   return packedFileNames;
 };
 
@@ -744,6 +791,7 @@ const getVisualsSchemaHash = (game: SupportedGames): string | undefined => {
 const getVisualsTableContribution = (pack: Pack): VisualsTableContribution => {
   const contribution: VisualsTableContribution = {
     variants: [],
+    variantDetails: [],
     unitVariants: [],
     landUnits: [],
     mainUnits: [],
@@ -770,25 +818,37 @@ const getVisualsTableContribution = (pack: Pack): VisualsTableContribution => {
   };
 
   forEachTableRow("variants_tables", (row) => {
-    const variantName = row.find(
-      (field) => field.name === "variant_name",
-    )?.resolvedKeyValue;
+    const value = (fieldName: string) =>
+      row.find((field) => field.name === fieldName)?.resolvedKeyValue || "";
+    const variantName = value("variant_name");
     if (!variantName) return;
-    const variantFilename = row.find(
-      (field) => field.name === "variant_filename",
-    )?.resolvedKeyValue;
-    contribution.variants.push([variantName, variantFilename || ""]);
+    const variantFilename = value("variant_filename");
+    contribution.variants.push([variantName, variantFilename]);
+    contribution.variantDetails!.push([
+      variantName,
+      {
+        techFolder: value("tech_folder"),
+        variantFilename,
+        lowPolyFilename: value("low_poly_filename"),
+        mountScale: value("mount_scale"),
+        scale: value("scale"),
+        scaleVariation: value("scale_variation"),
+        superLowPolyFilename: value("super_low_poly_filename"),
+      },
+    ]);
   });
   forEachTableRow("unit_variants_tables", (row) => {
-    const unitKey = row.find(
-      (field) => field.name === "unit",
-    )?.resolvedKeyValue;
+    const value = (fieldName: string) =>
+      row.find((field) => field.name === fieldName)?.resolvedKeyValue || "";
+    const unitKey = value("unit");
     if (!unitKey) return;
-    const faction =
-      row.find((field) => field.name === "faction")?.resolvedKeyValue || "";
-    const variantName =
-      row.find((field) => field.name === "variant")?.resolvedKeyValue || "";
-    contribution.unitVariants.push([unitKey, faction, variantName]);
+    contribution.unitVariants.push([
+      unitKey,
+      value("faction"),
+      value("variant"),
+      value("name"),
+      value("unit_card"),
+    ]);
   });
   forEachTableRow("main_units_tables", (row) => {
     const unitKey = row.find(
@@ -843,45 +903,100 @@ const getVisualsLocContribution = (pack: Pack): Array<[string, string]> => {
   const trie = getLocsTrie(pack);
   return trie ? Object.entries(trie.getEntries()) : [];
 };
-const dbDuplicationCancelStateByWebContentsId = new Map<
-  number,
-  { canceled: boolean }
->();
+const dbDuplicationCancelStateByWebContentsId = new Map<number, { canceled: boolean }>();
+const compressionAnalysisCancelStateByWebContentsId = new Map<number, { canceled: boolean }>();
+const compressionPackPathsInProgress = new Set<string>();
+interface ActiveWorkshopStagingRun {
+  runId: string;
+  senderId: number;
+  controller: AbortController;
+  canceled: boolean;
+  lastProgress: WorkshopStagingProgress;
+}
+let activeWorkshopStagingRun: ActiveWorkshopStagingRun | undefined;
 const globalSearchCancelStateByWebContentsId = new Map<
   number,
   { canceled: boolean; done?: Promise<GlobalSearchResponse> }
 >();
+
+const workshopStagingProgressChannel = "workshopModStagingProgress";
+
+const workshopStagingStageForPhase = (phase: WorkshopStagingProgress["phase"]): string => {
+  switch (phase) {
+    case "planning":
+      return "preparing";
+    case "pruning":
+      return "cleaning";
+    case "copying":
+      return "copying";
+    case "compressing":
+      return "compressing";
+    case "checkpointing":
+      return "saving";
+    case "completed":
+      return "complete";
+    case "canceled":
+      return "cleaning";
+    default:
+      return phase;
+  }
+};
+
+const makeWorkshopStagingProgressEvent = (
+  runId: string,
+  progress: WorkshopStagingProgress,
+  status: WorkshopModStagingProgressStatus,
+  overrides: Partial<WorkshopModStagingProgressEvent> = {},
+): WorkshopModStagingProgressEvent => {
+  const total = Number.isFinite(progress.total) ? Math.max(0, progress.total) : 0;
+  const completed = Number.isFinite(progress.current) ? Math.max(0, Math.min(total, progress.current)) : 0;
+  const byteFraction =
+    progress.bytesCopied !== undefined && progress.totalBytes !== undefined && progress.totalBytes > 0
+      ? Math.min(1, Math.max(0, progress.bytesCopied / progress.totalBytes))
+      : undefined;
+  const fileFraction =
+    progress.fileIndex !== undefined && progress.fileCount !== undefined && progress.fileCount > 0
+      ? Math.min(1, Math.max(0, progress.fileIndex / progress.fileCount))
+      : undefined;
+  const itemFraction = byteFraction ?? fileFraction ?? 0;
+  return {
+    runId,
+    status,
+    stage: workshopStagingStageForPhase(progress.phase),
+    ...(total > 0 ? { percent: Math.round(((completed + itemFraction) / total) * 100) } : {}),
+    completedMods: completed,
+    totalMods: total,
+    ...(progress.bytesCopied !== undefined ? { bytesCopied: progress.bytesCopied } : {}),
+    ...(progress.totalBytes !== undefined ? { totalBytes: progress.totalBytes } : {}),
+    ...(progress.fileIndex !== undefined ? { fileIndex: progress.fileIndex } : {}),
+    ...(progress.fileCount !== undefined ? { fileCount: progress.fileCount } : {}),
+    ...(progress.modName ? { currentMod: progress.modName } : {}),
+    ...(progress.phase === "compressing" && progress.message ? { currentFile: progress.message } : {}),
+    ...(progress.message ? { detail: progress.message } : {}),
+    ...overrides,
+  };
+};
+
+const sendWorkshopStagingProgress = (sender: Electron.WebContents, progress: WorkshopModStagingProgressEvent): void => {
+  if (sender.isDestroyed()) return;
+  try {
+    sender.send(workshopStagingProgressChannel, progress);
+  } catch {
+    // The renderer may close between the destroyed check and send.
+  }
+};
 /** Serializes the handoff between overlapping invocations from one viewer sender. */
 const globalSearchStartLockByWebContentsId = new Map<number, Promise<void>>();
-const dbIndirectReferenceCacheByWebContentsId = new Map<
-  number,
-  DBIndirectReferenceCacheContext
->();
-const createDBIndirectReferenceCacheContext =
-  (): DBIndirectReferenceCacheContext => ({
-    packByPath: new Map<string, Pack>(),
-    tableFilesByPackAndTable: new Map<string, PackedFile[]>(),
-    rowsByPackedFile: new WeakMap<PackedFile, AmendedSchemaField[][]>(),
-    columnIndexesByPackedFile: new WeakMap<PackedFile, Map<string, number>>(),
-    reverseRefIndexByKey: new Map(),
-    reverseRefTtlMs: 5 * 60 * 1000,
-    maxReverseRefEntries: 32,
-  });
-const toVariantMeshDefinitionPath = (value: string) => {
-  let path = normalizePackFilePath(value);
-  if (!path) return path;
-  if (!path.toLowerCase().endsWith(".variantmeshdefinition")) {
-    path = `${path}.variantmeshdefinition`;
-  }
-  const lower = path.toLowerCase();
-  if (!lower.startsWith("variantmeshes\\")) {
-    path = `variantmeshes\\variantmeshdefinitions\\${path}`;
-  } else if (!lower.startsWith("variantmeshes\\variantmeshdefinitions\\")) {
-    const baseName = nodePath.basename(path);
-    path = `variantmeshes\\variantmeshdefinitions\\${baseName}`;
-  }
-  return normalizePackFilePath(path);
-};
+const dbIndirectReferenceCacheByWebContentsId = new Map<number, DBIndirectReferenceCacheContext>();
+const createDBIndirectReferenceCacheContext = (): DBIndirectReferenceCacheContext => ({
+  packByPath: new Map<string, Pack>(),
+  tableFilesByPackAndTable: new Map<string, PackedFile[]>(),
+  rowsByPackedFile: new WeakMap<PackedFile, AmendedSchemaField[][]>(),
+  columnIndexesByPackedFile: new WeakMap<PackedFile, Map<string, number>>(),
+  reverseRefIndexByKey: new Map(),
+  reverseRefTtlMs: 5 * 60 * 1000,
+  maxReverseRefEntries: 32,
+});
 const decodePackedFileText = (packedFile: PackedFile) => {
   if (packedFile.text != null) return packedFile.text;
   if (!packedFile.buffer) return undefined;
@@ -893,6 +1008,24 @@ const decodePackedFileText = (packedFile: PackedFile) => {
     buffer.length >= 3 &&
     buffer.subarray(0, 3).toString("hex") === "efbbbf"
   ) {
+    return buffer.subarray(3).toString("utf8");
+  }
+  return buffer.toString("utf8");
+};
+const decodePackedAssetText = (buffer: Buffer) => {
+  if (buffer.length >= 2 && buffer.subarray(0, 2).toString("hex") === "fffe") {
+    return buffer.subarray(2).toString("utf16le");
+  }
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString("hex") === "efbbbf") {
+    return buffer.subarray(3).toString("utf8");
+  }
+  return buffer.toString("utf8");
+};
+const decodePackedAssetText = (buffer: Buffer) => {
+  if (buffer.length >= 2 && buffer.subarray(0, 2).toString("hex") === "fffe") {
+    return buffer.subarray(2).toString("utf16le");
+  }
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString("hex") === "efbbbf") {
     return buffer.subarray(3).toString("utf8");
   }
   return buffer.toString("utf8");
@@ -912,10 +1045,13 @@ const findPackedFileCaseInsensitive = (pack: Pack, fileName: string) => {
 };
 const findPackedFileInList = (packedFiles: PackedFile[], fileName: string) => {
   const normalizedTarget = normalizePackFilePathKey(fileName);
-  return packedFiles.find(
-    (packedFile) =>
-      normalizePackFilePathKey(packedFile.name) === normalizedTarget,
-  );
+  return packedFiles.find((packedFile) => normalizePackFilePathKey(packedFile.name) === normalizedTarget);
+};
+const getPackedFileImageData = (buffer: Buffer, fileName: string): { buffer: Buffer; mimeType?: string } => {
+  if (isDdsPackedFilePath(fileName)) {
+    return { buffer: encodeDdsAsPng(buffer), mimeType: "image/png" };
+  }
+  return { buffer, mimeType: getPackedFileMimeType(fileName) };
 };
 const getOrLoadPackFromAppData = async (packPath: string) => {
   let stat: { size: number; mtimeMs: number } | undefined;
@@ -1048,23 +1184,16 @@ const resolveVisualsFileInSession = async (
   options?: {
     variantMeshDefinitionFallback?: boolean;
     preferredPackPath?: string;
+    packCache?: Map<string, Pack | undefined>;
   },
 ) => {
   let requestedPath = normalizePackFilePath(fileName);
   if (!requestedPath) return undefined;
   if (options?.variantMeshDefinitionFallback) {
     const lowerRequested = requestedPath.toLowerCase();
-    const looksExplicitPath =
-      lowerRequested.includes("\\") ||
-      lowerRequested.startsWith("variantmeshes");
-    if (
-      lowerRequested.endsWith(".variantmeshdefinition") ||
-      !looksExplicitPath ||
-      !(
-        /\.[a-z0-9_]+$/i.test(lowerRequested) &&
-        !lowerRequested.endsWith(".variantmeshdefinition")
-      )
-    ) {
+    const hasNonVariantMeshDefinitionExtension =
+      /\.[a-z0-9_]+$/i.test(lowerRequested) && !lowerRequested.endsWith(".variantmeshdefinition");
+    if (!hasNonVariantMeshDefinitionExtension) {
       requestedPath = toVariantMeshDefinitionPath(requestedPath);
     }
   }
@@ -1081,7 +1210,13 @@ const resolveVisualsFileInSession = async (
         ]
       : searchPackPaths;
   for (const packPath of prioritizedPackPaths) {
-    const pack = await getOrLoadPackFromAppData(packPath);
+    let pack: Pack | undefined;
+    if (options?.packCache?.has(packPath)) {
+      pack = options.packCache.get(packPath);
+    } else {
+      pack = await getOrLoadPackFromAppData(packPath);
+      options?.packCache?.set(packPath, pack);
+    }
     if (!pack) continue;
     const matchedFile = findPackedFileCaseInsensitive(pack, requestedPath);
     if (!matchedFile) continue;
@@ -1219,7 +1354,7 @@ const appendCollisions = async (newPack: Pack) => {
     );
   }
 };
-const matchVanillaDBFiles = /^db\\.*\\data__/;
+const isLiveDBPackedFileName = (packedFileName: string) => parseLiveDBTablePath(packedFileName) != undefined;
 const appendPacksData = (newPack: Pack, mod?: Mod, emitToMainWindow = true) => {
   const existingPack = appData.packsData.find(
     (pack) => pack.path == newPack.path,
@@ -1233,11 +1368,7 @@ const appendPacksData = (newPack: Pack, mod?: Mod, emitToMainWindow = true) => {
     }
     const candidateFileNames = newPack.packedFiles
       .map((packedFile) => packedFile.name)
-      .filter(
-        (packedFileName) =>
-          packedFileName.match(matchVanillaDBFiles) ||
-          packedFileName.endsWith(".lua"),
-      );
+      .filter((packedFileName) => isLiveDBPackedFileName(packedFileName) || packedFileName.endsWith(".lua"));
     // Gathered once rather than scanned per candidate: a mod adding scripts of its own finds no
     // match for any of them, and that is the case that walked every vanilla pack in full each time.
     const vanillaFileNames = new Set<string>();
@@ -1753,6 +1884,56 @@ export const registerIpcMainListeners = (
     mainWindow?.webContents.send("handleLog", msg);
     console.log(msg);
   };
+  let vanillaCompressionCsv: string | undefined;
+  let vanillaCompressionCsvLoaded = false;
+  const getVanillaCompressionCsv = (): string | undefined => {
+    if (vanillaCompressionCsvLoaded) return vanillaCompressionCsv;
+    const candidates = [
+      nodePath.resolve(process.cwd(), "scripts/out/vanilla-pack-compression-by-extension.csv"),
+      nodePath.resolve(__dirname, "../scripts/out/vanilla-pack-compression-by-extension.csv"),
+      nodePath.resolve(__dirname, "../../scripts/out/vanilla-pack-compression-by-extension.csv"),
+      typeof process.resourcesPath === "string"
+        ? nodePath.join(process.resourcesPath, "scripts/out/vanilla-pack-compression-by-extension.csv")
+        : undefined,
+    ].filter((candidate): candidate is string => !!candidate);
+    for (const candidate of candidates) {
+      try {
+        vanillaCompressionCsv = fs.readFileSync(candidate, "utf8");
+        vanillaCompressionCsvLoaded = true;
+        return vanillaCompressionCsv;
+      } catch {
+        // Try the next development/packaged location.
+      }
+    }
+    // Cache the miss too; a packaged resource cannot appear while this process is running.
+    vanillaCompressionCsvLoaded = true;
+    return undefined;
+  };
+  const checkWorkshopStagingCleanupOnStartup = async (
+    config: Pick<ConfigForRenderer, "currentGame" | "cleanUpWorkshopModStagingAfterGameExit" | "appFolderPaths">,
+  ) => {
+    const gamePath = config.appFolderPaths.gamePath;
+    if (!config.cleanUpWorkshopModStagingAfterGameExit || !gamePath) {
+      appData.workshopStagingCleanupPending = false;
+      appData.workshopStagingCleanupGamePath = undefined;
+      return;
+    }
+
+    try {
+      const processIds = await findGameProcessIds(gameToProcessName[config.currentGame]);
+      appData.workshopStagingCleanupGamePath = gamePath;
+      if (processIds.length > 0) {
+        appData.workshopStagingCleanupPending = true;
+        log("Workshop staging cleanup is waiting for the running game to exit.");
+        return;
+      }
+
+      appData.workshopStagingCleanupPending = true;
+      await cleanupWorkshopStagingAfterGameExit();
+    } catch (error) {
+      reportWorkshopCleanupFailure(error);
+    }
+  };
   const packPathKey = (packPath: string) =>
     packPath.startsWith("memory://")
       ? packPath.toLowerCase()
@@ -1807,6 +1988,40 @@ export const registerIpcMainListeners = (
     if (remainingPaths.length > 0)
       appData.deletedPackFilePaths[packPath] = remainingPaths;
     else delete appData.deletedPackFilePaths[packPath];
+  };
+  const getPackNameForLoadOrderRules = (packPath: string, fallbackPackName?: string) => {
+    const mod = appData.allMods.find((candidate) => packPathKey(candidate.path) === packPathKey(packPath));
+    return mod?.name ?? findPackByPath(packPath)?.name ?? fallbackPackName;
+  };
+  const publishModLoadOrderRules = () => {
+    refreshMainLoadOrderRules();
+    mainWindow?.webContents.send("setModLoadOrderRules", appData.modLoadOrderRules);
+  };
+  const updateSavedPackLoadOrderRules = (
+    packPath: string,
+    unsavedFiles: PackedFile[],
+    deletedFilePaths: string[],
+    fallbackPackName?: string,
+  ) => {
+    const savedRulesFile = unsavedFiles.find((file) => isLoadOrderRulesPackedFilePath(file.name));
+    const deletedRulesFile = deletedFilePaths.some((filePath) => isLoadOrderRulesPackedFilePath(filePath));
+    if (!savedRulesFile && !deletedRulesFile) return;
+
+    const packName = getPackNameForLoadOrderRules(packPath, fallbackPackName);
+    if (!packName) return;
+
+    let rules: LoadOrderRule[] = [];
+    if (savedRulesFile && !deletedRulesFile) {
+      const text = savedRulesFile.text ?? (savedRulesFile.buffer ? decodePackedTextBuffer(savedRulesFile.buffer) : "");
+      const parsed = parseLoadOrderRulesFile(text, packName);
+      if (parsed.errors.length > 0) {
+        console.log(`saved load order rules in ${packName} have ${parsed.errors.length} bad line(s):`, parsed.errors);
+      }
+      rules = parsed.rules;
+    }
+
+    appData.modLoadOrderRules = replaceModLoadOrderRules(appData.modLoadOrderRules, packName, rules);
+    publishModLoadOrderRules();
   };
   const materializePackedFileForStaging = async (
     sourcePackPath: string,
@@ -1884,8 +2099,9 @@ export const registerIpcMainListeners = (
         );
       }
 
+      const sourceReadPath = await resolveVanillaViewerFilePackPath(sourcePackPath, normalizedFilePath);
       const sourceRead = await readPack(
-        sourcePackPath,
+        sourceReadPath,
         isDBFile
           ? {
               tablesToRead: [normalizedFilePath],
@@ -4129,7 +4345,7 @@ export const registerIpcMainListeners = (
     const signature = createHash("sha256")
       .update(
         JSON.stringify({
-          feature: 15,
+          feature: 19,
           game: appData.currentGame,
           schema: getVisualsSchemaHash(appData.currentGame),
           mods: getUnitViewerSignature(enabledMods),
@@ -4265,6 +4481,7 @@ export const registerIpcMainListeners = (
       assetCache: new Map(),
       assetCacheBytes: 0,
       pendingAssets: new Map(),
+      variantMeshCatalogs: new Map(),
       createdAt: Date.now(),
     };
     const { assets: statIcons } = await loadUnitViewerAssets(
@@ -4298,6 +4515,7 @@ export const registerIpcMainListeners = (
         assetCache: new Map(),
         assetCacheBytes: 0,
         pendingAssets: new Map(),
+        variantMeshCatalogs: new Map(),
         createdAt: Date.now(),
       });
       // The one being replaced is kept, and nothing older.
@@ -4336,8 +4554,10 @@ export const registerIpcMainListeners = (
         success: true,
         sessionId,
         groups: built.data.groups,
+        lordOptions: built.data.lordOptions,
         unitGroups: built.data.unitGroups,
         constants: built.data.constants,
+        characterExperience: built.data.characterExperience,
         statIcons,
       };
     } catch (error) {
@@ -4349,38 +4569,106 @@ export const registerIpcMainListeners = (
     }
   });
 
-  ipcMain.handle(
-    "getUnitViewerDetails",
-    async (_event, sessionId: string, unitKey: string) => {
-      try {
-        const session = unitViewerSessions.get(sessionId);
-        if (!session)
-          return { success: false, error: "Unit Viewer session expired" };
-        const unit = session.data.units.get(unitKey);
-        if (!unit)
-          return { success: false, error: `Unit ${unitKey} was not found` };
-        // Warmed in one pass over the packs rather than one request per icon, then handed over as URLs
-        // the protocol serves straight from that session cache.
-        const { resolved } = await loadUnitViewerAssets(
-          session,
-          session.data.iconPathsByUnit.get(unitKey) || [],
-          false,
-        );
-        const icons = Object.fromEntries(
-          resolved.map(
-            (iconPath) =>
-              [iconPath, unitAssetUrl(sessionId, iconPath)] as const,
-          ),
-        );
-        return { success: true, unit, icons };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : "Failed to load unit",
-        };
+  ipcMain.handle("getUnitViewerDetails", async (_event, sessionId: string, unitKey: string) => {
+    try {
+      const session = unitViewerSessions.get(sessionId);
+      if (!session) return { success: false, error: "Unit Viewer session expired" };
+      const unit = session.data.units.get(unitKey);
+      if (!unit) return { success: false, error: `Unit ${unitKey} was not found` };
+      // Warmed in one pass over the packs rather than one request per icon, then handed over as URLs
+      // the protocol serves straight from that session cache.
+      const { resolved } = await loadUnitViewerAssets(session, session.data.iconPathsByUnit.get(unitKey) || [], false);
+      const icons = Object.fromEntries(
+        resolved.map((iconPath) => [iconPath, unitAssetUrl(sessionId, iconPath)] as const),
+      );
+      return { success: true, unit, icons };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : "Failed to load unit" };
+    }
+  });
+
+  ipcMain.handle("getUnitPainterFactionMaskBindings", async (_event, sessionId: string, assetPath: string) => {
+    try {
+      const session = unitViewerSessions.get(sessionId);
+      if (!session) return { success: false, error: "Unit Viewer session expired" };
+      const rootPath = normalizePackFilePath(assetPath || "");
+      if (!rootPath) return { success: false, error: "Missing variantmeshdefinition path" };
+      const queue = [rootPath];
+      const seen = new Set<string>();
+      const bindings: Array<{ baseColourSourcePath: string; baseColourPreviewFileNames: string[]; maskUrl: string }> = [];
+      const bindingKeys = new Set<string>();
+      while (queue.length > 0) {
+        const requestedPath = queue.shift()!;
+        const key = normalizePackFilePathKey(requestedPath);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        const extension = getSupportedVisualDependencyExtension(requestedPath);
+        if (extension !== "variantmeshdefinition" && extension !== "wsmodel" && extension !== "xml.material") continue;
+        const asset = await getUnitViewerAsset(session, requestedPath);
+        if (!asset) continue;
+        const text = decodePackedAssetText(asset.buffer);
+        if (!text) continue;
+        if (extension === "xml.material") {
+          const textures = getVisualMaterialFactionTextures(text);
+          if (textures?.baseColourPath && textures.maskPath) {
+            const basePath = textures.baseColourPath;
+            const maskPath = textures.maskPath;
+            const bindingKey = `${normalizePackFilePathKey(basePath)}\0${normalizePackFilePathKey(maskPath)}`;
+            if (!bindingKeys.has(bindingKey)) {
+              bindingKeys.add(bindingKey);
+              const normalizedBasePath = basePath.replaceAll("\\", "/").trim().toLowerCase();
+              const stem = basePath.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "texture";
+              const cacheKey = `${normalizedBasePath}|default|False|ktx2|srgb=True`;
+              const hash = createHash("sha256").update(`${normalizedBasePath}|${cacheKey}`).digest("hex").slice(0, 10);
+              bindings.push({
+                baseColourSourcePath: basePath,
+                baseColourPreviewFileNames: [`${stem}_${hash}.ktx2`, `${stem}.ktx2`],
+                maskUrl: unitAssetUrl(sessionId, maskPath),
+              });
+            }
+          }
+        }
+        for (const reference of getSupportedVisualReferences(text)) {
+          const referenceExtension = getSupportedVisualDependencyExtension(reference);
+          if (referenceExtension === "variantmeshdefinition" || referenceExtension === "wsmodel" || referenceExtension === "xml.material") {
+            queue.push(reference);
+          }
+        }
       }
-    },
-  );
+      return { success: true, bindings };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : "Failed to resolve faction-colour masks" };
+    }
+  });
+
+  ipcMain.handle("getUnitViewerVariantMeshCatalog", async (_event, sessionId: string, assetPath: string) => {
+    try {
+      const session = unitViewerSessions.get(sessionId);
+      if (!session) return { success: false, error: "Unit Viewer session expired" };
+      const normalizedPath = normalizePackFilePath(assetPath || "");
+      if (!normalizedPath) return { success: false, error: "Missing variantmeshdefinition path" };
+      const cacheKey = normalizedPath.toLowerCase();
+      const cached = session.variantMeshCatalogs.get(cacheKey);
+      const catalogPromise =
+        cached ||
+        buildVariantMeshCatalog(normalizedPath, async (definitionPath) => {
+          const asset = await getUnitViewerAsset(session, definitionPath);
+          return asset ? decodePackedAssetText(asset.buffer) : undefined;
+        });
+      if (!cached) session.variantMeshCatalogs.set(cacheKey, catalogPromise);
+      try {
+        return { success: true, catalog: await catalogPromise };
+      } catch (error) {
+        if (session.variantMeshCatalogs.get(cacheKey) === catalogPromise) session.variantMeshCatalogs.delete(cacheKey);
+        throw error;
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to resolve unit appearances",
+      };
+    }
+  });
 
   /**
    * The unit viewer's images, served to `<img>` rather than sent as payloads.
@@ -4389,6 +4677,8 @@ export const registerIpcMainListeners = (
    * prewarm below is what keeps a whole roster to one read per pack instead of one per card.
    */
   registerAssetProtocol({
+    resolveMapCacheImage: (signature, imageName) =>
+      resolveEsfMapCachedImage(app.getPath("userData"), signature, imageName),
     resolveUnitViewerAsset: async (sessionId, assetPath) => {
       const session = unitViewerSessions.get(sessionId);
       if (!session) return undefined;
@@ -4403,7 +4693,10 @@ export const registerIpcMainListeners = (
         session.pendingAssets.delete(normalized),
       );
       session.pendingAssets.set(normalized, load);
-      return await load;
+      const resolved = await load;
+      if (!resolved) return undefined;
+      const image = getPackedFileImageData(resolved.buffer, resolved.resolvedPath);
+      return { buffer: image.buffer, mimeType: image.mimeType || resolved.mimeType };
     },
   });
 
@@ -5117,42 +5410,34 @@ export const registerIpcMainListeners = (
       .digest("hex");
   };
 
-  ipcMain.handle(
-    "getEsfMap",
-    async (
-      _event,
-      enabledMods: Mod[],
-      campaignName?: string,
-    ): Promise<EsfMapResponse> => {
-      try {
-        const signature = await getEsfMapSignature(enabledMods, campaignName);
-        const buildings = await ensureBuildingsData(enabledMods);
-        const registeredIconPath = (requestedPath: string) =>
-          Object.keys(buildings.icons).find(
-            (iconPath) =>
-              normalizeAssetPath(iconPath) ===
-              normalizeAssetPath(requestedPath),
-          );
-        const decorate = (map: import("./esfMap/types").EsfMapPayload) => {
-          const withFactions = addFactionDataToEsfMap(
-            map,
-            buildings.data,
-            (flagPath) => {
-              const registeredPath = registeredIconPath(flagPath);
-              return registeredPath
-                ? iconAssetUrl(buildings.iconGeneration, registeredPath)
-                : undefined;
-            },
-          );
-          const withClimates = addClimateDataToEsfMap(
-            withFactions,
-            buildings.data,
-          );
-          return addSettlementTypeDataToEsfMap(withClimates, buildings.data);
+  ipcMain.handle("getEsfMap", async (_event, enabledMods: Mod[], campaignName?: string): Promise<EsfMapResponse> => {
+    try {
+      const signature = await getEsfMapSignature(enabledMods, campaignName);
+      const buildings = await ensureBuildingsData(enabledMods);
+      // Indexed rather than scanned per lookup: the faction roster asks for a flag per faction, and
+      // most of the roster holds no land.
+      const iconPathsByNormalizedPath = new Map<string, string>();
+      for (const iconPath of Object.keys(buildings.icons)) {
+        // First registration wins, as the scan this replaces did.
+        const normalized = normalizeAssetPath(iconPath);
+        if (!iconPathsByNormalizedPath.has(normalized)) iconPathsByNormalizedPath.set(normalized, iconPath);
+      }
+      const registeredIconPath = (requestedPath: string) =>
+        iconPathsByNormalizedPath.get(normalizeAssetPath(requestedPath));
+      const decorate = (map: import("./esfMap/types").EsfMapPayload) => {
+        const withFactions = addFactionDataToEsfMap(map, buildings.data, (flagPath) => {
+          const registeredPath = registeredIconPath(flagPath);
+          return registeredPath ? iconAssetUrl(buildings.iconGeneration, registeredPath) : undefined;
+        });
+        const withClimates = addClimateDataToEsfMap(withFactions, buildings.data);
+        return {
+          ...addSettlementTypeDataToEsfMap(withClimates, buildings.data),
+          diplomacyIconUrls: buildings.diplomacyIconUrls,
         };
-        if (cachedEsfMapData?.signature === signature) {
-          return { success: true, map: decorate(cachedEsfMapData.data) };
-        }
+      };
+      if (cachedEsfMapData?.signature === signature) {
+        return { success: true, map: decorate(cachedEsfMapData.data) };
+      }
 
         const diskData = await loadEsfMapDiskCache(
           app.getPath("userData"),
@@ -5163,34 +5448,41 @@ export const registerIpcMainListeners = (
           return { success: true, map: decorate(diskData) };
         }
 
-        const extractedMap = await loadEsfMapData(enabledMods, campaignName);
-        const data = decorate(extractedMap);
-        const cacheData = {
-          ...data,
-          factions: data.factions.map(
-            ({ flagUrl: _flagUrl, ...faction }) => faction,
-          ),
-        };
-        await saveEsfMapDiskCache(
-          app.getPath("userData"),
-          signature,
-          cacheData,
-        );
-        cachedEsfMapData = { signature, data: cacheData };
-        return { success: true, map: data };
-      } catch (error) {
-        console.log("getEsfMap failed:", error);
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    },
-  );
+      const extractedMap = await loadEsfMapData(enabledMods, campaignName);
+      const data = decorate(extractedMap);
+      const { diplomacyIconUrls: _diplomacyIconUrls, ...withoutDiplomacyUrls } = data;
+      const cacheData = {
+        ...withoutDiplomacyUrls,
+        factions: data.factions.map(({ flagUrl: _flagUrl, ...faction }) => faction),
+      };
+      await saveEsfMapDiskCache(app.getPath("userData"), signature, cacheData);
+      // saveEsfMapDiskCache replaces the cached copy's data URLs with whmm:// URLs. Copy those
+      // lightweight refs onto the decorated response too, so the first cold IPC response does not
+      // send the large base64 strings that were just externalised.
+      data.backgroundImage = cacheData.backgroundImage;
+      data.backgroundTextImage = cacheData.backgroundTextImage;
+      cachedEsfMapData = { signature, data: cacheData };
+      return { success: true, map: data };
+    } catch (error) {
+      console.log("getEsfMap failed:", error);
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
 
   // --- Buildings -------------------------------------------------------------
   const BUILDING_FRAME_PATH = "ui\\skins\\default\\building_frame.png";
   const BUILDING_FRAME_PACK_NAME = "ui2.pack";
+  const DIPLOMACY_ICON_PATHS = {
+    mil_access: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_soft_access.png",
+    def_ally: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_defensive_alliance.png",
+    mil_ally: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_military_alliance.png",
+    non_aggression: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_nonaggression_pact.png",
+    vassals: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_vassal.png",
+    trade: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_trade_agreement.png",
+    war: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_join_war.png",
+    peace: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_peace.png",
+    confederate: "ui\\campaign ui\\diplomacy_icons\\diplomatic_option_confederation.png",
+  } as const;
   /** Folders the game keeps building icons in. Scanned, not assumed: `icon` holds a bare name. */
   const BUILDING_ICON_PREFIXES = [
     "ui\\campaign ui\\building_icons\\",
@@ -5535,7 +5827,7 @@ export const registerIpcMainListeners = (
       }),
     );
     const signatureInputs: BuildingsVanillaSignatureInputs = {
-      feature: 3,
+      feature: 4,
       game: appData.currentGame,
       schema: getVisualsSchemaHash(appData.currentGame),
       identities,
@@ -5726,7 +6018,7 @@ export const registerIpcMainListeners = (
     const signature = createHash("sha256")
       .update(
         JSON.stringify({
-          feature: 3,
+          feature: 4,
           game: appData.currentGame,
           vanilla: vanilla.signature,
           mods: orderedEnabledMods.map((mod) => ({
@@ -5881,6 +6173,7 @@ export const registerIpcMainListeners = (
       const flagPath = factionFlagPath(faction.flagPath);
       if (flagPath) factionFlagPaths.add(flagPath);
     }
+    const diplomacyIconPaths = Object.values(DIPLOMACY_ICON_PATHS);
     const wantedPaths = Array.from(
       new Set([
         ...(buildingFrame ? [BUILDING_FRAME_PATH] : []),
@@ -5889,6 +6182,7 @@ export const registerIpcMainListeners = (
         ...effectIconPaths,
         ...unitCardPaths,
         ...factionFlagPaths,
+        ...diplomacyIconPaths,
       ]),
     );
     const wantedPackPaths = new Set(
@@ -5907,11 +6201,18 @@ export const registerIpcMainListeners = (
           )
         : {};
     if (buildingFrame) icons[BUILDING_FRAME_PATH] = buildingFrame;
+    const iconGeneration = registerIconAssets(icons);
+    const diplomacyIconUrls = Object.fromEntries(
+      Object.entries(DIPLOMACY_ICON_PATHS).flatMap(([key, iconPath]) =>
+        icons[iconPath] ? [[key, iconAssetUrl(iconGeneration, iconPath)]] : [],
+      ),
+    );
     return {
       iconPathByBaseName,
       buildingIconPaths: iconIndex.buildingIconPaths,
       icons,
-      iconGeneration: registerIconAssets(icons),
+      iconGeneration,
+      diplomacyIconUrls,
     };
   };
 
@@ -7190,18 +7491,12 @@ export const registerIpcMainListeners = (
     }
   };
   const onPackDeleted = async (path: string, isDeletedFromContent = false) => {
+    await invalidateCachedPackData(path);
     if (!mainWindow) return;
     mainWindow.webContents.send("handleLog", "MOD REMOVED: " + path);
     console.log("MOD REMOVED: " + path);
     await removeMod(mainWindow, path);
-    if (
-      appData.packsData &&
-      appData.packsData.some((pack) => pack.path == path)
-    ) {
-      appData.packsData = appData.packsData.filter((pack) => pack.path != path);
-    }
-    const dataFolder =
-      appData.gamesToGameFolderPaths[appData.currentGame].dataFolder;
+    const dataFolder = appData.gamesToGameFolderPaths[appData.currentGame].dataFolder;
     if (isDeletedFromContent && dataFolder) {
       try {
         const potentialSymlinkDataPath = nodePath.join(
@@ -7220,10 +7515,7 @@ export const registerIpcMainListeners = (
     }
     removePackFromCollisions(path);
   };
-  const matchTableNamePart = /^db\\(.*?)\\data__/;
-  const getAllMods = async (
-    afterModsPopulated?: () => void | Promise<void>,
-  ) => {
+  const getAllMods = async (afterModsPopulated?: () => void | Promise<void>) => {
     const timeStartedFetchingSubbedIds = Date.now();
     try {
       appData.subscribedModIds = [];
@@ -7263,6 +7555,7 @@ export const registerIpcMainListeners = (
       mainWindow?.webContents.send("modsPopulated", mods);
       await afterModsPopulated?.();
       const packHeadersToSend: PackHeaderData[] = [];
+      const modLoadOrderRules: Record<string, LoadOrderRule[]> = {};
       await Promise.all(
         mods.map(async (mod) => {
           try {
@@ -7277,6 +7570,13 @@ export const registerIpcMainListeners = (
               packHeaderData.dependencyPacks.length > 0
             )
               packHeadersToSend.push(packHeaderData);
+
+            // The header scan already told us whether this pack has rules, so only the few that do
+            // get opened again.
+            if (packHeaderData.hasLoadOrderRules) {
+              const rules = await readModLoadOrderRulesCached(mod.path, mod.name, packHeaderData);
+              if (rules.length > 0) modLoadOrderRules[mod.name] = rules;
+            }
           } catch (e) {
             if (e instanceof Error) {
               log(e.message);
@@ -7285,6 +7585,9 @@ export const registerIpcMainListeners = (
         }),
       );
       mainWindow?.webContents.send("setPackHeaderData", packHeadersToSend);
+      appData.modLoadOrderRules = modLoadOrderRules;
+      refreshMainLoadOrderRules();
+      mainWindow?.webContents.send("setModLoadOrderRules", modLoadOrderRules);
       await savePackHeaderCache();
       if (!appData.saveSetupDone) {
         appData.saveSetupDone = true;
@@ -7333,15 +7636,16 @@ export const registerIpcMainListeners = (
             } catch {
               // pack doesn't exist, skip
             }
-            const cacheEntry = vanillaStat && vanillaCache[dataPackPath];
+            const cacheEntry = vanillaStat ? getVanillaPackFilesCacheEntry(vanillaCache, dataPackPath) : undefined;
+            const cachedPackIndex = cacheEntry ? getCachedVanillaPackIndexFromEntry(cacheEntry) : undefined;
             const cacheHit =
-              cacheEntry &&
-              cacheEntry.size === vanillaStat!.size &&
-              cacheEntry.lastChangedLocal === vanillaStat!.mtimeMs;
+              !!cachedPackIndex &&
+              cacheEntry!.size === vanillaStat!.size &&
+              cacheEntry!.lastChangedLocal === vanillaStat!.mtimeMs;
             let packedFileNames: string[];
             if (cacheHit) {
               console.log("VANILLA PACK CACHE HIT:", dataPackPath);
-              packedFileNames = cacheEntry.packedFileNames;
+              packedFileNames = cachedPackIndex.packedFiles.map((packedFile) => packedFile.name);
             } else {
               console.log("READING DATA PACK");
               const dataPackData = await readPackRegistered(dataMod.path, {
@@ -7357,32 +7661,21 @@ export const registerIpcMainListeners = (
                   appendPacksData(dataPackData);
                 }
                 packedFileNames = dataPackData.packedFiles.map((pf) => pf.name);
-                if (vanillaStat) {
-                  vanillaCache[dataPackPath] = {
-                    size: vanillaStat.size,
-                    lastChangedLocal: vanillaStat.mtimeMs,
-                    packedFileNames,
-                  };
-                  await saveVanillaPackFilesCache();
-                }
               } else {
                 packedFileNames = [];
               }
             }
             if (cacheHit) {
-              // Reconstruct a minimal Pack for vanillaPacks and appendPacksData from cached file names
+              // Reconstruct the pack from cached index metadata without reopening or reparsing it.
               const reconstructedPack: Pack = {
                 name: baseVanillaPackName,
                 path: dataPackPath,
-                packedFiles: packedFileNames.map((name) => ({
-                  name,
-                  file_size: 0,
-                  start_pos: 0,
-                })),
-                packHeader: {} as PackHeader,
+                packedFiles: cachedPackIndex.packedFiles,
+                packHeader: cachedPackIndex.packHeader,
                 lastChangedLocal: vanillaStat!.mtimeMs,
                 size: vanillaStat!.size,
                 readTables: [],
+                dependencyPacks: cachedPackIndex.dependencyPacks,
               };
               appData.vanillaPacks.push(reconstructedPack);
               if (
@@ -7393,10 +7686,10 @@ export const registerIpcMainListeners = (
                 appendPacksData(reconstructedPack);
               }
             }
-            const vanillaDBFileNames = packedFileNames
-              .map((name) => name.match(matchTableNamePart))
-              .filter((matchResult) => matchResult)
-              .map((matchResult) => matchResult![1]);
+            const vanillaDBFileNames = packedFileNames.flatMap((name) => {
+              const dbName = parseLiveDBTablePath(name)?.dbName;
+              return dbName ? [dbName] : [];
+            });
             if (vanillaDBFileNames.length > 0) {
               appData.vanillaPacksDBFileNames = Array.from(
                 new Set([
@@ -7407,6 +7700,7 @@ export const registerIpcMainListeners = (
             }
           }
         }
+        await saveVanillaPackFilesCache();
         appData.vanillaPacksDBFileNames.sort((a, b) => collator.compare(a, b));
         await fetchGameUpdates();
       }
@@ -7522,8 +7816,8 @@ export const registerIpcMainListeners = (
         })
         .on("change", async (path) => {
           console.log("NEW CONTENT CHANGE", path);
-          onPackDeleted(path);
-          onNewPackFound(path);
+          await onPackDeleted(path);
+          await onNewPackFound(path);
         });
     }
     if (!downloadsWatcher) {
@@ -7576,9 +7870,9 @@ export const registerIpcMainListeners = (
         })
         .on("change", async (path) => {
           console.log("data pack changed:", path);
-          onPackDeleted(path);
+          await onPackDeleted(path);
           console.log("dataWatcher change:", path);
-          onNewPackFound(path);
+          await onNewPackFound(path);
         });
     }
     const customFolders =
@@ -7632,8 +7926,8 @@ export const registerIpcMainListeners = (
         })
         .on("change", async (path) => {
           console.log("pack changed:", path);
-          onPackDeleted(path);
-          onNewPackFound(path);
+          await onPackDeleted(path);
+          await onNewPackFound(path);
         });
     }
   };
@@ -7676,29 +7970,30 @@ export const registerIpcMainListeners = (
       appData.currentGame = appState.currentGame;
       initializeAllSchemaForGame(appData.currentGame);
       appData.gameToConfig = appState.games;
-      appData.isChangingGameProcessPriority =
-        appState.isChangingGameProcessPriority;
-      appData.isFeaturesForModdersEnabled =
-        appState.isFeaturesForModdersEnabled || false;
+      appData.recentPackPaths = sanitizeRecentPackPaths(appState.recentPackPaths, [
+        ...vanillaPackNames,
+        ...appData.allVanillaPackNames,
+      ]);
+      appData.isChangingGameProcessPriority = appState.isChangingGameProcessPriority;
+      appData.isFeaturesForModdersEnabled = appState.isFeaturesForModdersEnabled || false;
       appData.moddersPrefix = appState.moddersPrefix || "";
-      appData.isShowingSkillNodeSetNames =
-        appState.isShowingSkillNodeSetNames ??
-        appData.isShowingSkillNodeSetNames;
-      appData.hideRepeatedKeyPrefixes =
-        appState.hideRepeatedKeyPrefixes ?? appData.hideRepeatedKeyPrefixes;
-      appData.isShowingHiddenSkills =
-        appState.isShowingHiddenSkills ?? appData.isShowingHiddenSkills;
+      appData.isRigidModelV2CompressionEnabled =
+        appState.isRigidModelV2CompressionEnabled ?? appData.isRigidModelV2CompressionEnabled;
+      appData.compressModsOnUpload = appState.compressModsOnUpload ?? appData.compressModsOnUpload;
+      appData.isShowingSkillNodeSetNames = appState.isShowingSkillNodeSetNames ?? appData.isShowingSkillNodeSetNames;
+      appData.hideRepeatedKeyPrefixes = appState.hideRepeatedKeyPrefixes ?? appData.hideRepeatedKeyPrefixes;
+      appData.isShowingHiddenSkills = appState.isShowingHiddenSkills ?? appData.isShowingHiddenSkills;
       appData.isShowingHiddenModifiersInsideSkills =
-        appState.isShowingHiddenModifiersInsideSkills ??
-        appData.isShowingHiddenModifiersInsideSkills;
-      appData.isCheckingSkillRequirements =
-        appState.isCheckingSkillRequirements ??
-        appData.isCheckingSkillRequirements;
-      appData.skillTreesDisplayMode =
-        appState.skillTreesDisplayMode ?? appData.skillTreesDisplayMode;
-      appData.technologyTreesDisplayMode =
-        appState.technologyTreesDisplayMode ??
-        appData.technologyTreesDisplayMode;
+        appState.isShowingHiddenModifiersInsideSkills ?? appData.isShowingHiddenModifiersInsideSkills;
+      appData.isCheckingSkillRequirements = appState.isCheckingSkillRequirements ?? appData.isCheckingSkillRequirements;
+      appData.skillTreesDisplayMode = appState.skillTreesDisplayMode ?? appData.skillTreesDisplayMode;
+      appData.technologyTreesDisplayMode = appState.technologyTreesDisplayMode ?? appData.technologyTreesDisplayMode;
+
+      await checkWorkshopStagingCleanupOnStartup({
+        currentGame: appState.currentGame,
+        cleanUpWorkshopModStagingAfterGameExit: appState.cleanUpWorkshopModStagingAfterGameExit,
+        appFolderPaths: currentGameFolderPaths,
+      });
 
       // flatten to the single-game view the renderer works with
       const { games, gameFolderPaths, ...options } = appState;
@@ -7714,8 +8009,10 @@ export const registerIpcMainListeners = (
   ipcMain.on("getAllModData", (event, ids: string[]) => {
     // if we keep restarting the app in dev steam refuse requests eventually
     if (isDev) return;
+    const workshopIds = ids.filter((id) => id !== "");
+    if (workshopIds.length === 0) return;
     fetchModData(
-      ids.filter((id) => id !== ""),
+      workshopIds,
       (modData) => {
         tempModDatas.push(modData);
         sendModData();
@@ -7790,6 +8087,11 @@ export const registerIpcMainListeners = (
     isMovie: boolean;
     hasStartpos: boolean;
     dependencyPacks: string[];
+    /** Absent on entries written before load order rules existed, which forces a re-read. */
+    hasLoadOrderRules?: boolean;
+    loadOrderRulesFileName?: string;
+    /** The parsed rules, kept here so a restart does not reopen every pack that has them. */
+    loadOrderRules?: LoadOrderRule[];
   }
   type PackHeaderCache = Record<string, PackHeaderCacheEntry>;
   const PACK_HEADER_CACHE_FILE = "pack-headers-cache.bin";
@@ -7840,12 +8142,15 @@ export const registerIpcMainListeners = (
         entry &&
         entry.size === stat.size &&
         entry.lastChangedLocal === stat.mtimeMs &&
-        typeof entry.hasStartpos === "boolean"
+        typeof entry.hasStartpos === "boolean" &&
+        typeof entry.hasLoadOrderRules === "boolean"
       ) {
         return {
           path,
           isMovie: entry.isMovie,
           hasStartpos: entry.hasStartpos,
+          hasLoadOrderRules: entry.hasLoadOrderRules,
+          loadOrderRulesFileName: entry.loadOrderRulesFileName,
           dependencyPacks: entry.dependencyPacks,
         };
       }
@@ -7860,10 +8165,51 @@ export const registerIpcMainListeners = (
         lastChangedLocal: stat.mtimeMs,
         isMovie: data.isMovie,
         hasStartpos: data.hasStartpos,
+        hasLoadOrderRules: data.hasLoadOrderRules ?? false,
+        loadOrderRulesFileName: data.loadOrderRulesFileName,
         dependencyPacks: data.dependencyPacks,
       };
     }
     return data;
+  };
+
+  /**
+   * The rules a pack ships inside itself.
+   *
+   * Only ever called for packs whose header scan already said they have the file, so the great
+   * majority of packs are never reopened for this. The parsed result is cached next to the header
+   * data under the same size and mtime key.
+   */
+  const readModLoadOrderRulesCached = async (
+    packPath: string,
+    packName: string,
+    headerData: PackHeaderData,
+  ): Promise<LoadOrderRule[]> => {
+    if (!headerData.hasLoadOrderRules) return [];
+
+    const cache = await loadPackHeaderCache();
+    const entry = cache[packPath];
+    if (entry?.loadOrderRules) return entry.loadOrderRules;
+
+    let rules: LoadOrderRule[] = [];
+    try {
+      const fileName = headerData.loadOrderRulesFileName ?? LOAD_ORDER_RULES_PACKED_FILE_PATH;
+      const pack = await readPack(packPath, { filesToRead: [fileName], skipParsingTables: true });
+      const packedFile = pack.packedFiles.find((file) => isLoadOrderRulesPackedFilePath(file.name));
+      if (packedFile?.buffer) {
+        const parsed = parseLoadOrderRulesFile(decodePackedTextBuffer(packedFile.buffer), packName);
+        if (parsed.errors.length > 0) {
+          console.log(`load order rules in ${packName} have ${parsed.errors.length} bad line(s):`, parsed.errors);
+        }
+        rules = parsed.rules;
+      }
+    } catch (error) {
+      // A pack we cannot read rules from simply contributes none; it must not break the mod scan.
+      console.log("failed to read load order rules from", packPath, error);
+    }
+
+    if (entry) entry.loadOrderRules = rules;
+    return rules;
   };
   interface FlowExecutionCacheEntry {
     signatureHash: string;
@@ -7992,9 +8338,8 @@ export const registerIpcMainListeners = (
     for (const pack of appData.vanillaPacks) {
       if (!vanillaPackPathsSet.has(pack.path)) continue;
       for (const packedFile of pack.packedFiles) {
-        const tableNameMatch = packedFile.name.match(matchTableNamePart);
-        if (!tableNameMatch) continue;
-        const tableName = tableNameMatch[1];
+        const tableName = parseLiveDBTablePath(packedFile.name)?.dbName;
+        if (!tableName) continue;
         tableToPackPaths[tableName] = tableToPackPaths[tableName] || [];
         if (!tableToPackPaths[tableName].includes(pack.path)) {
           tableToPackPaths[tableName].push(pack.path);
@@ -8012,9 +8357,8 @@ export const registerIpcMainListeners = (
       if (!modPaths.has(pack.path)) continue;
       for (const packedFile of pack.packedFiles) {
         if (!packedFile.schemaFields) continue;
-        const tableNameMatch = packedFile.name.match(matchTableNamePart);
-        if (!tableNameMatch) continue;
-        const tableName = tableNameMatch[1];
+        const tableName = parseLiveDBTablePath(packedFile.name)?.dbName;
+        if (!tableName) continue;
         const dbVersion = getDBVersion(packedFile);
         if (!dbVersion) continue;
         const tableFieldRefs = tablesAndDBFieldsThatReference[tableName];
@@ -8438,7 +8782,9 @@ export const registerIpcMainListeners = (
           // Calculate and update cache
           foundTables = tablesForMatching.filter((tableForMatching) =>
             currentPack.packedFiles.some((packedFile) =>
-              packedFile.name.startsWith(tableForMatching),
+              tableForMatching === "whmmflows\\"
+                ? isPackedFlowName(packedFile.name)
+                : packedFile.name.startsWith(tableForMatching),
             ),
           );
           cache[currentPack.path] = {
@@ -9110,46 +9456,41 @@ export const registerIpcMainListeners = (
         clearDeletedPackFilePath(packPath, packedFile.name);
         broadcastPackStagingState(packPath);
 
-        return { success: true };
-      } catch (error) {
-        console.error("Error saving DB table edits:", error);
-        return {
-          success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : "Failed to save DB table edits",
-        };
+      return { success: true };
+    } catch (error) {
+      console.error("Error saving DB table edits:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to save DB table edits",
+      };
+    }
+  });
+  ipcMain.handle("saveTextPackedFileEdits", async (event, packPath: string, filePath: string, text: string) => {
+    try {
+      let originalText: string | undefined;
+      if (!packPath.startsWith("memory://")) {
+        try {
+          // Text files in the app's pack index usually carry only their position and size, so read
+          // the original payload before deciding whether this edit is a no-op. Use the indexed
+          // spelling when available because readPack's targeted lookup is case-sensitive.
+          const indexedFile = findPackedFileInList(findPackByPath(packPath)?.packedFiles ?? [], filePath);
+          const originalPack = await readPack(packPath, {
+            skipParsingTables: true,
+            filesToRead: [indexedFile?.name ?? filePath],
+          });
+          const originalFile = findPackedFileCaseInsensitive(originalPack, filePath);
+          if (originalFile) originalText = decodePackedFileText(originalFile);
+        } catch (error) {
+          // Failing to read the source should not discard a user's edit. In that case the previous
+          // staging behavior is retained and the next save can try again.
+          console.warn("Could not read original text file while staging edit:", filePath, error);
+        }
       }
-    },
-  );
-  ipcMain.handle(
-    "saveTextPackedFileEdits",
-    async (event, packPath: string, filePath: string, text: string) => {
-      try {
-        let unsavedFiles = appData.unsavedPacksData[packPath];
-        if (!unsavedFiles) {
-          unsavedFiles = [];
-          appData.unsavedPacksData[packPath] = unsavedFiles;
-        }
 
-        const buffer = Buffer.from(text, "utf8");
-        const nextUnsavedFile = {
-          name: filePath,
-          file_size: buffer.length,
-          start_pos: -1,
-          text,
-          buffer,
-        } as PackedFile;
-
-        const existingFileIndex = unsavedFiles.findIndex(
-          (file) => file.name == filePath,
-        );
-        if (existingFileIndex != -1) {
-          unsavedFiles.splice(existingFileIndex, 1, nextUnsavedFile);
-        } else {
-          unsavedFiles.push(nextUnsavedFile);
-        }
+      const unsavedFiles = appData.unsavedPacksData[packPath] ?? [];
+      const nextUnsavedFiles = applyTextPackedFileEdit(unsavedFiles, filePath, text, originalText);
+      if (nextUnsavedFiles.length > 0) appData.unsavedPacksData[packPath] = nextUnsavedFiles;
+      else delete appData.unsavedPacksData[packPath];
 
         clearDeletedPackFilePath(packPath, filePath);
         broadcastPackStagingState(packPath);
@@ -9168,14 +9509,21 @@ export const registerIpcMainListeners = (
     },
   );
   /**
-   * Drops everything read from a pack file that has just been written over, so the next read sees
-   * the new contents instead of the old ones.
+   * Drops everything read from a pack file that has just been written over or changed externally,
+   * so the next read sees the new contents instead of the old ones.
    */
   const invalidateCachedPackData = async (packPath: string) => {
-    appData.packsData = appData.packsData.filter(
-      (packData) => packData.path !== packPath,
-    );
-    delete appData.packMetaData[packPath];
+    appData.packsData = appData.packsData.filter((packData) => packData.path !== packPath);
+    const hadCustomizableMod = packPath in appData.customizableMods;
+    invalidateCustomizableModPath(appData, packPath);
+    if (hadCustomizableMod) {
+      mainWindow?.webContents.send("setCustomizableMods", appData.customizableMods);
+    }
+    const customizableModsCache = await loadCustomizableModsCache();
+    if (packPath in customizableModsCache) {
+      delete customizableModsCache[packPath];
+      await saveCustomizableModsCache(customizableModsCache);
+    }
     if (packHeaderCache) {
       delete packHeaderCache[packPath];
       await savePackHeaderCache();
@@ -9188,103 +9536,85 @@ export const registerIpcMainListeners = (
       await saveFlowExecutionCache();
     }
   };
-  ipcMain.handle(
-    "savePackWithUnsavedFiles",
-    async (event, packPath: string) => {
-      try {
-        console.log("savePackWithUnsavedFiles:", packPath);
-        // Memory packs must use "Save As" since they don't have a disk location
-        if (packPath.startsWith("memory://")) {
-          return {
-            success: false,
-            error: "Memory packs must use 'Save As' to specify a save location",
-          };
-        }
-        const unsavedFiles = appData.unsavedPacksData[packPath] ?? [];
-        const deletedPaths = appData.deletedPackFilePaths[packPath] ?? [];
-        if (unsavedFiles.length === 0 && deletedPaths.length === 0) {
-          return {
-            success: false,
-            error: "No unsaved files found for this pack",
-          };
-        }
-        // Read the original pack
-        const pack = await readPack(packPath, { skipParsingTables: true });
-        // Convert unsaved files to format for writePack (similar to DBClone.ts)
-        const filesToSave = unsavedFiles.map((file) => {
-          const buffer = file.buffer || Buffer.from(file.text || "");
-          return {
-            name: file.name,
-            buffer: buffer,
-            file_size: buffer.length,
-          };
-        });
-        // Sort files by name (as done in DBClone.ts)
-        const sortedFilesToSave = filesToSave.toSorted((firstPf, secondPf) => {
-          return firstPf.name.localeCompare(secondPf.name);
-        });
-        // Try to replace the existing pack
-        let savePath = packPath;
-        let replacedOriginal = true;
-        try {
-          // Write the pack with unsaved files appended/overwritten
-          await writePack(
-            sortedFilesToSave,
-            savePath,
-            pack,
-            true,
-            [],
-            deletedPaths,
-          );
-          console.log(`Pack saved to: ${savePath}`);
-        } catch (error) {
-          // If we can't overwrite (file in use/locked), save as _modified instead
-          if (error instanceof Error && error.message.includes("EPERM")) {
-            console.log(
-              "Cannot overwrite pack (file in use), saving as _modified instead",
-            );
-            const packDir = nodePath.dirname(packPath);
-            const packName = nodePath.basename(packPath, ".pack");
-            savePath = nodePath.join(packDir, `${packName}_modified.pack`);
-            replacedOriginal = false;
-            await writePack(
-              sortedFilesToSave,
-              savePath,
-              pack,
-              true,
-              [],
-              deletedPaths,
-            );
-            console.log(`Pack saved to: ${savePath}`);
-          } else {
-            throw error;
-          }
-        }
-        if (replacedOriginal) {
-          await invalidateCachedPackData(savePath);
-          broadcastSavedPackData(packPath, unsavedFiles, deletedPaths);
-        }
-        // Clear unsaved files for this pack
-        delete appData.unsavedPacksData[packPath];
-        delete appData.deletedPackFilePaths[packPath];
-        broadcastPackStagingState(packPath);
-        return {
-          success: true,
-          savedPath: savePath,
-          replacedOriginal,
-          warning: !replacedOriginal
-            ? "Could not replace original pack (file in use). Saved as _modified.pack instead."
-            : undefined,
-        };
-      } catch (error) {
-        console.error("Error saving pack with unsaved files:", error);
+  ipcMain.handle("savePackWithUnsavedFiles", async (event, packPath: string) => {
+    try {
+      console.log("savePackWithUnsavedFiles:", packPath);
+      // Memory packs must use "Save As" since they don't have a disk location
+      if (packPath.startsWith("memory://")) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : "Failed to save pack",
+          error: "Memory packs must use 'Save As' to specify a save location",
         };
       }
-    },
-  );
+      const unsavedFiles = appData.unsavedPacksData[packPath] ?? [];
+      const deletedPaths = appData.deletedPackFilePaths[packPath] ?? [];
+      if (unsavedFiles.length === 0 && deletedPaths.length === 0) {
+        return {
+          success: false,
+          error: "No unsaved files found for this pack",
+        };
+      }
+      // Read the original pack
+      const pack = await readPack(packPath, { skipParsingTables: true });
+      // Convert unsaved files to format for writePack (similar to DBClone.ts)
+      const filesToSave = unsavedFiles.map((file) => {
+        const buffer = file.buffer || Buffer.from(file.text || "");
+        return {
+          name: file.name,
+          buffer: buffer,
+          file_size: buffer.length,
+        };
+      });
+      // Sort files by name (as done in DBClone.ts)
+      const sortedFilesToSave = filesToSave.toSorted((firstPf, secondPf) => {
+        return firstPf.name.localeCompare(secondPf.name);
+      });
+      // Try to replace the existing pack
+      let savePath = packPath;
+      let replacedOriginal = true;
+      try {
+        // Write the pack with unsaved files appended/overwritten
+        await writePack(sortedFilesToSave, savePath, pack, true, [], deletedPaths);
+        console.log(`Pack saved to: ${savePath}`);
+      } catch (error) {
+        // If we can't overwrite (file in use/locked), save as _modified instead
+        if (error instanceof Error && error.message.includes("EPERM")) {
+          console.log("Cannot overwrite pack (file in use), saving as _modified instead");
+          const packDir = nodePath.dirname(packPath);
+          const packName = nodePath.basename(packPath, ".pack");
+          savePath = nodePath.join(packDir, `${packName}_modified.pack`);
+          replacedOriginal = false;
+          await writePack(sortedFilesToSave, savePath, pack, true, [], deletedPaths);
+          console.log(`Pack saved to: ${savePath}`);
+        } else {
+          throw error;
+        }
+      }
+      if (replacedOriginal) {
+        await invalidateCachedPackData(savePath);
+        updateSavedPackLoadOrderRules(savePath, unsavedFiles, deletedPaths, pack.name);
+        broadcastSavedPackData(packPath, unsavedFiles, deletedPaths);
+      }
+      // Clear unsaved files for this pack
+      delete appData.unsavedPacksData[packPath];
+      delete appData.deletedPackFilePaths[packPath];
+      broadcastPackStagingState(packPath);
+      return {
+        success: true,
+        savedPath: savePath,
+        replacedOriginal,
+        warning: !replacedOriginal
+          ? "Could not replace original pack (file in use). Saved as _modified.pack instead."
+          : undefined,
+      };
+    } catch (error) {
+      console.error("Error saving pack with unsaved files:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to save pack",
+      };
+    }
+  });
   ipcMain.handle(
     "savePackAsWithUnsavedFiles",
     async (
@@ -9380,6 +9710,7 @@ export const registerIpcMainListeners = (
         console.log(`Pack saved to: ${savePath}`);
         // Whatever was read from the pack we just wrote over describes the old file now.
         if (overwriteExisting) await invalidateCachedPackData(savePath);
+        updateSavedPackLoadOrderRules(savePath, unsavedFiles, deletedPaths);
         // Clear unsaved files for this pack
         delete appData.unsavedPacksData[packPath];
         delete appData.deletedPackFilePaths[packPath];
@@ -9634,6 +9965,7 @@ export const registerIpcMainListeners = (
         });
       const {
         variantsByName,
+        variantDetailsByName,
         unitToVariantRows,
         landUnitKeys,
         unitKeyToOriginPackPath,
@@ -9665,18 +9997,21 @@ export const registerIpcMainListeners = (
         );
       };
       const landUnitToSubcultures = new Map<string, string[]>();
+      const landUnitToFactions = new Map<string, Set<string>>();
       for (const [unitKey, factionKeys] of unitToPermissionFactions) {
         const landUnitKey =
           mainUnitToLandUnit.get(unitKey) ||
           (landUnitKeys.has(unitKey) ? unitKey : undefined);
         if (!landUnitKey) continue;
+        const availableFactions = landUnitToFactions.get(landUnitKey) || new Set<string>();
         const subcultures = new Set<string>();
         for (const factionKey of factionKeys) {
+          availableFactions.add(factionKey);
           const subculture = factionToSubculture.get(factionKey);
           if (subculture) subcultures.add(subculture);
         }
-        if (subcultures.size > 0)
-          landUnitToSubcultures.set(landUnitKey, Array.from(subcultures));
+        landUnitToFactions.set(landUnitKey, availableFactions);
+        if (subcultures.size > 0) landUnitToSubcultures.set(landUnitKey, Array.from(subcultures));
       }
       const visualsUnits = [] as {
         unitKey: string;
@@ -9684,6 +10019,18 @@ export const registerIpcMainListeners = (
         localizedName: string;
         variantName?: string;
         variantMeshPath?: string;
+        unitVariantName?: string;
+        unitCard?: string;
+        variantDetails?: {
+          techFolder: string;
+          variantFilename: string;
+          lowPolyFilename: string;
+          mountScale: string;
+          scale: string;
+          scaleVariation: string;
+          superLowPolyFilename: string;
+        };
+        availableFactions: string[];
         originPackPath: string;
         originLabel: string;
         cultureKey: string;
@@ -9739,6 +10086,7 @@ export const registerIpcMainListeners = (
             unitKey,
             faction: "",
             localizedName,
+            availableFactions: Array.from(landUnitToFactions.get(unitKey) || []).sort((a, b) => collator.compare(a, b)),
             originPackPath,
             originLabel,
             ...addCultureMetadata(""),
@@ -9760,6 +10108,10 @@ export const registerIpcMainListeners = (
             localizedName,
             variantName: row.variantName || undefined,
             variantMeshPath,
+            unitVariantName: row.name || undefined,
+            unitCard: row.unitCard || undefined,
+            variantDetails: row.variantName ? variantDetailsByName.get(row.variantName) : undefined,
+            availableFactions: Array.from(landUnitToFactions.get(unitKey) || []).sort((a, b) => collator.compare(a, b)),
             originPackPath,
             originLabel,
             ...addCultureMetadata(row.faction),
@@ -9823,9 +10175,8 @@ export const registerIpcMainListeners = (
           ...dbPriorityMods.map((mod) => mod.path),
         ],
         fileSearchPackPaths,
-        visualFiles: areAllFileContributionsCached
-          ? mergeVisualsFileContributions(cachedFileContributions)
-          : undefined,
+        visualFiles: areAllFileContributionsCached ? mergeVisualsFileContributions(cachedFileContributions) : undefined,
+        variantMeshCatalogs: new Map(),
         createdAt: Date.now(),
       });
       return {
@@ -9844,113 +10195,108 @@ export const registerIpcMainListeners = (
       };
     }
   });
-  ipcMain.handle(
-    "readVariantMeshDefinition",
-    async (event, sessionId: string, fileName: string) => {
-      try {
-        const session = visualsSessions.get(sessionId);
-        if (!session)
-          return {
-            success: false,
-            error: "Visuals session expired or missing",
-          };
-        const resolved = await resolveVisualsFileInSession(session, fileName, {
-          variantMeshDefinitionFallback: true,
-        });
-        if (!resolved?.requestedPath)
-          return {
-            success: false,
-            error: "Missing variantmeshdefinition path",
-          };
-        if (!resolved.pack || !resolved.fileName) {
-          return {
-            success: false,
-            error: `File not found in enabled mods or vanilla visuals packs (variants*.pack/data.pack): ${resolved.requestedPath}`,
-          };
-        }
-        await readFromExistingPack(resolved.pack, {
-          filesToRead: [resolved.fileName],
-          skipParsingTables: true,
-        });
-        const refreshedFile = findPackedFileCaseInsensitive(
-          resolved.pack,
-          resolved.fileName,
-        );
-        if (refreshedFile) {
-          const text = decodePackedFileText(refreshedFile);
-          if (text == null) {
-            return {
-              success: false,
-              error: `Unable to decode ${resolved.fileName}`,
-            };
-          }
-          return {
-            success: true,
-            text,
-            resolved: {
-              packPath: resolved.packPath,
-              fileName: resolved.fileName,
-            },
-          };
-        }
+  ipcMain.handle("readVariantMeshDefinition", async (event, sessionId: string, fileName: string) => {
+    try {
+      const session = visualsSessions.get(sessionId);
+      if (!session) return { success: false, error: "Visuals session expired or missing" };
+      const resolved = await resolveVisualsFileInSession(session, fileName, {
+        variantMeshDefinitionFallback: true,
+      });
+      if (!resolved?.requestedPath) return { success: false, error: "Missing variantmeshdefinition path" };
+      if (!resolved.pack || !resolved.fileName) {
         return {
           success: false,
-          error: `File was found but could not be reloaded: ${resolved.fileName}`,
-        };
-      } catch (error) {
-        console.error("Error reading variantmeshdefinition:", error);
-        return {
-          success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : "Failed to read variantmeshdefinition",
+          error: `File not found in enabled mods or vanilla visuals packs (variants*.pack/data.pack): ${resolved.requestedPath}`,
         };
       }
-    },
-  );
-  ipcMain.handle(
-    "searchVisualsFiles",
-    async (
-      event,
-      sessionId: string,
-      query: string,
-      offset = 0,
-      limit = 200,
-    ) => {
-      try {
-        const session = visualsSessions.get(sessionId);
-        if (!session)
-          return {
-            success: false,
-            error: "Visuals session expired or missing",
-          };
-        const normalizedQuery = normalizePackFilePathKey(query || "");
-        const cachedFiles = await getVisualsFilesForSession(session);
-        const allResults = normalizedQuery
-          ? cachedFiles.filter((file) =>
-              normalizePackFilePathKey(file.path).includes(normalizedQuery),
-            )
-          : cachedFiles;
-        const safeOffset = Math.max(0, offset || 0);
-        const safeLimit = Math.max(1, Math.min(1000, limit || 200));
+      await readFromExistingPack(resolved.pack, {
+        filesToRead: [resolved.fileName],
+        skipParsingTables: true,
+      });
+      const refreshedFile = findPackedFileCaseInsensitive(resolved.pack, resolved.fileName);
+      if (refreshedFile) {
+        const text = decodePackedFileText(refreshedFile);
+        if (text == null) {
+          return { success: false, error: `Unable to decode ${resolved.fileName}` };
+        }
         return {
           success: true,
-          total: allResults.length,
-          results: allResults.slice(safeOffset, safeOffset + safeLimit),
-        };
-      } catch (error) {
-        console.error("Error searching visuals files:", error);
-        return {
-          success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : "Failed to search visuals files",
+          text,
+          resolved: {
+            packPath: resolved.packPath,
+            fileName: resolved.fileName,
+          },
         };
       }
-    },
-  );
+      return { success: false, error: `File was found but could not be reloaded: ${resolved.fileName}` };
+    } catch (error) {
+      console.error("Error reading variantmeshdefinition:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to read variantmeshdefinition",
+      };
+    }
+  });
+  ipcMain.handle("getVisualsVariantMeshCatalog", async (_event, sessionId: string, assetPath: string) => {
+    try {
+      const session = visualsSessions.get(sessionId);
+      if (!session) return { success: false, error: "Visuals session expired or missing" };
+      const normalizedPath = normalizePackFilePath(assetPath || "");
+      if (!normalizedPath) return { success: false, error: "Missing variantmeshdefinition path" };
+      const cacheKey = normalizedPath.toLowerCase();
+      const cached = session.variantMeshCatalogs.get(cacheKey);
+      const catalogPromise =
+        cached ||
+        buildVariantMeshCatalog(normalizedPath, async (definitionPath) => {
+          const resolved = await resolveVisualsFileInSession(session, definitionPath, {
+            variantMeshDefinitionFallback: true,
+          });
+          if (!resolved?.pack || !resolved.fileName) return undefined;
+          await readFromExistingPack(resolved.pack, {
+            filesToRead: [resolved.fileName],
+            skipParsingTables: true,
+          });
+          const refreshedFile = findPackedFileCaseInsensitive(resolved.pack, resolved.fileName);
+          return refreshedFile ? decodePackedFileText(refreshedFile) : undefined;
+        });
+      if (!cached) session.variantMeshCatalogs.set(cacheKey, catalogPromise);
+      try {
+        return { success: true, catalog: await catalogPromise };
+      } catch (error) {
+        if (session.variantMeshCatalogs.get(cacheKey) === catalogPromise) session.variantMeshCatalogs.delete(cacheKey);
+        throw error;
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to resolve Visuals appearances",
+      };
+    }
+  });
+  ipcMain.handle("searchVisualsFiles", async (event, sessionId: string, query: string, offset = 0, limit = 1000) => {
+    try {
+      const session = visualsSessions.get(sessionId);
+      if (!session) return { success: false, error: "Visuals session expired or missing" };
+      const normalizedQuery = normalizePackFilePathKey(query || "");
+      const cachedFiles = await getVisualsFilesForSession(session);
+      const allResults = normalizedQuery
+        ? cachedFiles.filter((file) => normalizePackFilePathKey(file.path).includes(normalizedQuery))
+        : cachedFiles;
+      const safeOffset = Math.max(0, offset || 0);
+      const safeLimit = Math.max(1, Math.min(1000, limit || 1000));
+      return {
+        success: true,
+        total: allResults.length,
+        results: allResults.slice(safeOffset, safeOffset + safeLimit),
+      };
+    } catch (error) {
+      console.error("Error searching visuals files:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to search visuals files",
+      };
+    }
+  });
   ipcMain.handle(
     "openInAssetEditor",
     async (
@@ -10179,64 +10525,11 @@ export const registerIpcMainListeners = (
       }
     },
   );
-  ipcMain.handle(
-    "readFileFromPack",
-    async (event, packPath: string, fileName: string) => {
-      try {
-        console.log("readFileFromPack:", packPath, fileName);
-        const unsavedFile = findPackedFileInList(
-          appData.unsavedPacksData[packPath] || [],
-          fileName,
-        );
-        if (unsavedFile) {
-          const viewerKind = getPackedFileViewerKind(fileName);
-          if (!viewerKind) {
-            return {
-              success: false,
-              error: "Unsupported file type",
-            };
-          }
-          const unsavedBuffer =
-            unsavedFile.buffer ||
-            (unsavedFile.text != null
-              ? Buffer.from(unsavedFile.text, "utf8")
-              : undefined);
-          if (!unsavedBuffer) {
-            return {
-              success: false,
-              error: "File has no readable content",
-            };
-          }
-          if (viewerKind === "image") {
-            return {
-              success: true,
-              base64: unsavedBuffer.toString("base64"),
-              mimeType: getPackedFileMimeType(fileName),
-            };
-          }
-          return { success: true, text: decodePackedFileText(unsavedFile) };
-        }
-        const deletedFileKeys = new Set(
-          (appData.deletedPackFilePaths[packPath] ?? []).map(
-            normalizePackFilePathKey,
-          ),
-        );
-        if (deletedFileKeys.has(normalizePackFilePathKey(fileName))) {
-          return {
-            success: false,
-            error: `File "${fileName}" was deleted from the pack and has not been saved yet`,
-          };
-        }
-        // Read the pack with the specific file
-        const pack = await readPack(packPath, { filesToRead: [fileName] });
-        // Find the file
-        const file = findPackedFileCaseInsensitive(pack, fileName);
-        if (!file) {
-          return {
-            success: false,
-            error: `File "${fileName}" not found in pack`,
-          };
-        }
+  ipcMain.handle("readFileFromPack", async (event, packPath: string, fileName: string) => {
+    try {
+      console.log("readFileFromPack:", packPath, fileName);
+      const unsavedFile = findPackedFileInList(appData.unsavedPacksData[packPath] || [], fileName);
+      if (unsavedFile) {
         const viewerKind = getPackedFileViewerKind(fileName);
         if (!viewerKind) {
           return {
@@ -10244,54 +10537,89 @@ export const registerIpcMainListeners = (
             error: "Unsupported file type",
           };
         }
-        if (viewerKind === "image") {
-          if (!file.buffer) {
-            return {
-              success: false,
-              error: "Image data is unavailable",
-            };
-          }
-          return {
-            success: true,
-            base64: file.buffer.toString("base64"),
-            mimeType: getPackedFileMimeType(fileName),
-          };
-        }
-        if (file.text != null) {
-          return { success: true, text: file.text };
-        }
-        if (!file.buffer) {
+        const unsavedBuffer =
+          unsavedFile.buffer || (unsavedFile.text != null ? Buffer.from(unsavedFile.text, "utf8") : undefined);
+        if (!unsavedBuffer) {
           return {
             success: false,
             error: "File has no readable content",
           };
         }
-        return { success: true, text: decodePackedTextBuffer(file.buffer) };
-      } catch (error) {
-        console.error("Error reading file from pack:", error);
+        if (viewerKind === "image") {
+          const image = getPackedFileImageData(unsavedBuffer, fileName);
+          return {
+            success: true,
+            base64: image.buffer.toString("base64"),
+            mimeType: image.mimeType,
+          };
+        }
+        return { success: true, text: decodePackedFileText(unsavedFile) };
+      }
+      const deletedFileKeys = new Set((appData.deletedPackFilePaths[packPath] ?? []).map(normalizePackFilePathKey));
+      if (deletedFileKeys.has(normalizePackFilePathKey(fileName))) {
         return {
           success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : "Failed to read file from pack",
+          error: `File "${fileName}" was deleted from the pack and has not been saved yet`,
         };
       }
-    },
-  );
+      // The viewer's db.pack tree also contains files whose winning bytes live in another vanilla
+      // pack. Resolve that source here, keeping the full payload read lazy until this request.
+      const sourcePackPath = await resolveVanillaViewerFilePackPath(packPath, fileName);
+      const pack = await readPack(sourcePackPath, { filesToRead: [fileName] });
+      // Find the file
+      const file = findPackedFileCaseInsensitive(pack, fileName);
+      if (!file) {
+        return {
+          success: false,
+          error: `File "${fileName}" not found in pack`,
+        };
+      }
+      const viewerKind = getPackedFileViewerKind(fileName);
+      if (!viewerKind) {
+        return {
+          success: false,
+          error: "Unsupported file type",
+        };
+      }
+      if (viewerKind === "image") {
+        if (!file.buffer) {
+          return {
+            success: false,
+            error: "Image data is unavailable",
+          };
+        }
+        const image = getPackedFileImageData(file.buffer, fileName);
+        return {
+          success: true,
+          base64: image.buffer.toString("base64"),
+          mimeType: image.mimeType,
+        };
+      }
+      if (file.text != null) {
+        return { success: true, text: file.text };
+      }
+      if (!file.buffer) {
+        return {
+          success: false,
+          error: "File has no readable content",
+        };
+      }
+      return { success: true, text: decodePackedTextBuffer(file.buffer) };
+    } catch (error) {
+      console.error("Error reading file from pack:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to read file from pack",
+      };
+    }
+  });
   ipcMain.handle("getFlowFilesFromPack", async (event, packPath: string) => {
     try {
       console.log("getFlowFilesFromPack:", packPath);
       // Check if there are unsaved flow files for this pack
       const unsavedFiles = appData.unsavedPacksData[packPath] || [];
-      const unsavedFlowFiles = unsavedFiles.filter((file) =>
-        isPackedFlowName(file.name),
-      );
-      const deletedFileKeys = new Set(
-        (appData.deletedPackFilePaths[packPath] ?? []).map(
-          normalizePackFilePathKey,
-        ),
-      );
+      const unsavedFlowFiles = unsavedFiles.filter((file) => isPackedFlowName(file.name));
+      const deletedFileKeys = new Set((appData.deletedPackFilePaths[packPath] ?? []).map(normalizePackFilePathKey));
       // Read the pack to get flow files
       const pack = await readPack(packPath, {
         skipParsingTables: true,
@@ -10361,11 +10689,10 @@ export const registerIpcMainListeners = (
       // `allMods` is the disk-scan catalog and its `isEnabled` flags are not changed when the
       // renderer toggles a mod. Use the live enabled list for this field instead, otherwise the
       // viewer's enabled-mods picker is empty even while the manager has enabled mods.
-      const enabledModPaths = new Set(
-        appData.enabledMods.map((mod) =>
-          nodePath.resolve(mod.path).toLowerCase(),
-        ),
-      );
+      const enabledModPaths = new Set(appData.enabledMods.map((mod) => nodePath.resolve(mod.path).toLowerCase()));
+      const folderPaths = appData.gamesToGameFolderPaths[appData.currentGame];
+      const sourceOrder = normalizeModSourceOrder(folderPaths, appData.isFeaturesForModdersEnabled);
+      const sourcePriorityById = new Map(sourceOrder.map((sourceId, index) => [sourceId, index]));
       const seenPaths = new Set<string>();
       const packs = mods
         .filter((mod) => !mod.isDeleted && !!mod.path)
@@ -10383,6 +10710,11 @@ export const registerIpcMainListeners = (
             nodePath.resolve(mod.path).toLowerCase(),
           ),
           isInData: !!mod.isInData,
+          // This is the same ordering used by resolveModsBySourcePriority: source order first,
+          // then data/modding folders before the ordinary data folder. Lower is higher priority.
+          priority:
+            (sourcePriorityById.get(getModSourceId(mod)) ?? sourceOrder.length) * 2 +
+            (getModSourceId(mod) === DATA_MOD_SOURCE_ID && mod.isInModding ? 0 : 1),
         }))
         .toSorted((first, second) => {
           const firstLabel = first.humanName?.trim() || first.name;
@@ -10402,6 +10734,201 @@ export const registerIpcMainListeners = (
           error instanceof Error ? error.message : "Failed to load mod packs",
       };
     }
+  });
+  ipcMain.on("cancelCompressionAnalysis", (event) => {
+    const state = compressionAnalysisCancelStateByWebContentsId.get(event.sender.id);
+    if (state) state.canceled = true;
+  });
+  ipcMain.handle(
+    "startCompressionAnalysis",
+    async (
+      event,
+      request: CompressionAnalysisRequest,
+    ): Promise<import("./compressionAnalysis").CompressionAnalysisStartResponse> => {
+      if (appData.currentGame !== "wh3") {
+        return { accepted: false, reason: "unsupportedGame" };
+      }
+      const requestedPackPaths = Array.isArray(request?.packPaths)
+        ? request.packPaths.filter((packPath): packPath is string => typeof packPath === "string")
+        : [];
+      const enabledMods = appData.enabledMods.filter((mod) => !mod.isDeleted && !!mod.path);
+      if (enabledMods.length === 0 || requestedPackPaths.length === 0) {
+        return { accepted: false, reason: "noEnabledMods" };
+      }
+      const webContentsId = event.sender.id;
+      if (compressionAnalysisCancelStateByWebContentsId.has(webContentsId)) {
+        return { accepted: false, busy: true, reason: "alreadyRunning" };
+      }
+      const normalizeRequestedPath = (packPath: string) => nodePath.resolve(packPath).toLowerCase();
+      const enabledPathSet = new Set(enabledMods.map((mod) => normalizeRequestedPath(mod.path)));
+      const vanillaPathSet = new Set(
+        appData.vanillaPacks
+          .map((pack) => normalizeRequestedPath(pack.path))
+          .concat(
+            [...appData.allVanillaPackNames].map((packName) => {
+              const dataFolder = appData.gamesToGameFolderPaths.wh3?.dataFolder;
+              return dataFolder ? normalizeRequestedPath(nodePath.join(dataFolder, packName)) : "";
+            }),
+          ),
+      );
+      const packPaths: string[] = [];
+      const seenPaths = new Set<string>();
+      for (const packPath of requestedPackPaths) {
+        const normalizedPath = normalizeRequestedPath(packPath);
+        if (
+          !enabledPathSet.has(normalizedPath) ||
+          vanillaPathSet.has(normalizedPath) ||
+          seenPaths.has(normalizedPath)
+        ) {
+          continue;
+        }
+        seenPaths.add(normalizedPath);
+        packPaths.push(packPath);
+      }
+      if (packPaths.length === 0) return { accepted: false, reason: "noEnabledMods" };
+
+      const cancelState = { canceled: false };
+      compressionAnalysisCancelStateByWebContentsId.set(webContentsId, cancelState);
+      const sendProgress = (progress: CompressionAnalysisProgress) => {
+        if (event.sender.isDestroyed()) return;
+        try {
+          event.sender.send("compressionAnalysisProgress", progress);
+        } catch {
+          // The renderer may close between the destroyed check and send.
+        }
+      };
+      try {
+        const result: CompressionAnalysisResult = await analyzeCompressionPacks(packPaths, {
+          isCanceled: () => cancelState.canceled || event.sender.isDestroyed(),
+          onProgress: sendProgress,
+          vanillaCsv: getVanillaCompressionCsv(),
+        });
+        return { accepted: true, result };
+      } catch (error) {
+        return {
+          accepted: true,
+          result: {
+            status: "error",
+            packs: [],
+            overall: {
+              currentSize: 0,
+              projectedSize: 0,
+              bytesSaved: 0,
+              wholePackPercentSaved: 0,
+              projectedSizeIncludingRigidModelV2: 0,
+              wholePackPercentSavedIncludingRigidModelV2: 0,
+              packCount: packPaths.length,
+              analyzedPackCount: 0,
+              testedCount: 0,
+              skippedCount: 0,
+              errorCount: 1,
+              acceptedCount: 0,
+              sampledRejectedCount: 0,
+              existing: {
+                NONE: { count: 0, storedBytes: 0 },
+                LZ4: { count: 0, storedBytes: 0 },
+                ZSTD: { count: 0, storedBytes: 0 },
+                UNKNOWN: { count: 0, storedBytes: 0 },
+              },
+              existingCounts: { NONE: 0, LZ4: 0, ZSTD: 0, UNKNOWN: 0 },
+              existingStoredBytes: { NONE: 0, LZ4: 0, ZSTD: 0, UNKNOWN: 0 },
+            },
+            requestedPackCount: requestedPackPaths.length,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        };
+      } finally {
+        if (compressionAnalysisCancelStateByWebContentsId.get(webContentsId) === cancelState) {
+          compressionAnalysisCancelStateByWebContentsId.delete(webContentsId);
+        }
+      }
+    },
+  );
+  const compressPackWithAnalysis = async (
+    packPath: string,
+    includeRigidModelV2: boolean,
+    options: { outputPath?: string; allowNoEligible?: boolean } = {},
+  ): Promise<CompressPackResponse> => {
+    const gameFolder = appData.gamesToGameFolderPaths.wh3?.gamePath;
+    if (!gameFolder) return { success: false, error: "Set the Warhammer 3 game folder before compressing packs." };
+
+    const normalizedPackPath = nodePath.resolve(packPath).toLowerCase();
+    if (compressionPackPathsInProgress.has(normalizedPackPath)) {
+      return { success: false, error: "This pack is already being compressed." };
+    }
+    compressionPackPathsInProgress.add(normalizedPackPath);
+
+    try {
+      // Analyze again in the main process so renderer data can never choose unsafe files/codecs.
+      const analysisResult = await analyzeCompressionPacks([packPath], {
+        vanillaCsv: getVanillaCompressionCsv(),
+      });
+      const analysis = analysisResult.packs[0];
+      if (!analysis || !analysis.success) {
+        return { success: false, error: analysis?.errors[0] || analysisResult.error || "Pack analysis failed." };
+      }
+      const hasEligibleFiles =
+        analysis.acceptedCount > 0 || (includeRigidModelV2 && analysis.rigidModelV2Wins.length > 0);
+      if (!hasEligibleFiles && options.allowNoEligible) {
+        return {
+          success: true,
+          packPath: options.outputPath ?? packPath,
+          originalSize: analysis.currentSize,
+          compressedSize: analysis.currentSize,
+          compressedFileCount: 0,
+        };
+      }
+      return await compressAnalyzedPack(packPath, analysis, gameFolder, includeRigidModelV2, {
+        outputPath: options.outputPath,
+      });
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      compressionPackPathsInProgress.delete(normalizedPackPath);
+    }
+  };
+
+  ipcMain.handle("compressPack", async (_event, request: CompressPackRequest): Promise<CompressPackResponse> => {
+    if (!appData.isFeaturesForModdersEnabled) {
+      return { success: false, error: "Enable Features For Modders before compressing packs." };
+    }
+    if (appData.currentGame !== "wh3") {
+      return { success: false, error: "Pack compression is available for Warhammer 3 only." };
+    }
+    if (!request || typeof request.packPath !== "string" || request.packPath.trim() === "") {
+      return { success: false, error: "No pack was selected." };
+    }
+    const normalizePackPath = (packPath: string) => nodePath.resolve(packPath).toLowerCase();
+    const normalizedRequestedPath = normalizePackPath(request.packPath);
+    const enabledMod = appData.enabledMods.find(
+      (mod) => !mod.isDeleted && !!mod.path && normalizePackPath(mod.path) === normalizedRequestedPath,
+    );
+    if (!enabledMod) return { success: false, error: "Only currently enabled mod packs can be compressed." };
+    const dataFolder = appData.gamesToGameFolderPaths.wh3?.dataFolder;
+    const vanillaPaths = new Set(
+      appData.vanillaPacks
+        .map((pack) => normalizePackPath(pack.path))
+        .concat(
+          [...appData.allVanillaPackNames].map((packName) =>
+            dataFolder ? normalizePackPath(nodePath.join(dataFolder, packName)) : "",
+          ),
+        ),
+    );
+    if (vanillaPaths.has(normalizedRequestedPath)) {
+      return { success: false, error: "Vanilla packs cannot be compressed." };
+    }
+    const copyToDataFolder = request.copyToDataFolder === true;
+    const isInDataFolder = !!dataFolder && isPathInsideFolder(enabledMod.path, dataFolder);
+    const dataPackPath = dataFolder ? nodePath.join(dataFolder, nodePath.basename(enabledMod.path)) : undefined;
+    const dataAlreadyContainsPack = !!dataPackPath && fs.existsSync(dataPackPath);
+    if (copyToDataFolder && (isInDataFolder || dataAlreadyContainsPack)) {
+      return { success: false, error: "This pack already exists in the data folder; Ctrl-click did nothing." };
+    }
+    if (copyToDataFolder && !dataFolder) {
+      return { success: false, error: "Set the Warhammer 3 data folder before copying compressed packs." };
+    }
+    const outputPath = copyToDataFolder ? nodePath.join(dataFolder!, nodePath.basename(enabledMod.path)) : undefined;
+    return await compressPackWithAnalysis(enabledMod.path, request.includeRigidModelV2 === true, { outputPath });
   });
   ipcMain.on("cancelGlobalSearch", (event) => {
     const state = globalSearchCancelStateByWebContentsId.get(event.sender.id);
@@ -10636,17 +11163,9 @@ export const registerIpcMainListeners = (
       seenPaths.add(resolvedPath);
 
       const unsavedFlowFiles = appData.unsavedPacksData[mod.path] ?? [];
-      const deletedFileKeys = new Set(
-        (appData.deletedPackFilePaths[mod.path] ?? []).map(
-          normalizePackFilePathKey,
-        ),
-      );
-      let hasFlows = unsavedFlowFiles.some((file) =>
-        isPackedFlowName(file.name),
-      );
-      const retainedPack = appData.packsData.find(
-        (pack) => nodePath.resolve(pack.path) === resolvedPath,
-      );
+      const deletedFileKeys = new Set((appData.deletedPackFilePaths[mod.path] ?? []).map(normalizePackFilePathKey));
+      let hasFlows = unsavedFlowFiles.some((file) => isPackedFlowName(file.name));
+      const retainedPack = appData.packsData.find((pack) => nodePath.resolve(pack.path) === resolvedPath);
       if (!hasFlows && retainedPack) {
         hasFlows = retainedPack.packedFiles.some(
           (file) =>
@@ -10907,105 +11426,135 @@ export const registerIpcMainListeners = (
         );
     }
   });
-  ipcMain.on(
-    "selectContentFolder",
-    async (event, requestedGame: SupportedGames | undefined) => {
-      try {
-        if (!mainWindow) return;
-        const dialogReturnValue = await dialog.showOpenDialog(mainWindow, {
-          properties: ["openDirectory", "showHiddenFiles"],
-        });
-        if (!dialogReturnValue.canceled) {
-          const contentFolderPath = dialogReturnValue.filePaths[0];
-          const game = requestedGame || appData.currentGame;
-          appData.gamesToGameFolderPaths[game].contentFolder =
-            contentFolderPath;
-          mainWindow?.webContents.send("setContentFolder", contentFolderPath);
-          refreshModsIfFoldersValid(requestedGame);
+  ipcMain.on("selectContentFolder", async (event, requestedGame: SupportedGames | undefined) => {
+    try {
+      if (!mainWindow) return;
+      const dialogReturnValue = await dialog.showOpenDialog(mainWindow, {
+        properties: ["openDirectory", "showHiddenFiles"],
+      });
+      if (!dialogReturnValue.canceled) {
+        const contentFolderPath = dialogReturnValue.filePaths[0];
+        const game = requestedGame || appData.currentGame;
+        appData.gamesToGameFolderPaths[game].contentFolder = contentFolderPath;
+        mainWindow?.webContents.send("setContentFolder", contentFolderPath);
+        refreshModsIfFoldersValid(requestedGame);
+      }
+    } catch (e) {
+      console.log(e);
+    }
+  });
+  ipcMain.on("selectWarhammer3Folder", async (event, requestedGame: SupportedGames | undefined) => {
+    try {
+      if (!mainWindow) return;
+      const dialogReturnValue = await dialog.showOpenDialog(mainWindow, {
+        properties: ["openDirectory", "showHiddenFiles"],
+      });
+      if (!dialogReturnValue.canceled) {
+        const wh3FolderPath = dialogReturnValue.filePaths[0];
+        const game = requestedGame || appData.currentGame;
+        appData.gamesToGameFolderPaths[game].gamePath = wh3FolderPath;
+        appData.gamesToGameFolderPaths[game].dataFolder = nodePath.join(wh3FolderPath, "/data/");
+        mainWindow?.webContents.send("setWarhammer3Folder", wh3FolderPath);
+        if (appData.gamesToGameFolderPaths[game].gamePath == undefined) return;
+        const calculatedContentPath = nodePath.join(
+          appData.gamesToGameFolderPaths[game].gamePath as string,
+          "..",
+          "..",
+          "workshop",
+          "content",
+          gameToSteamId[game],
+        );
+        if (fs.existsSync(calculatedContentPath)) {
+          appData.gamesToGameFolderPaths[game].contentFolder = calculatedContentPath;
+          mainWindow?.webContents.send("setContentFolder", calculatedContentPath);
         }
-      } catch (e) {
-        console.log(e);
-      }
-    },
-  );
-  ipcMain.on(
-    "selectWarhammer3Folder",
-    async (event, requestedGame: SupportedGames | undefined) => {
-      try {
-        if (!mainWindow) return;
-        const dialogReturnValue = await dialog.showOpenDialog(mainWindow, {
-          properties: ["openDirectory", "showHiddenFiles"],
-        });
-        if (!dialogReturnValue.canceled) {
-          const wh3FolderPath = dialogReturnValue.filePaths[0];
-          const game = requestedGame || appData.currentGame;
-          appData.gamesToGameFolderPaths[game].gamePath = wh3FolderPath;
-          appData.gamesToGameFolderPaths[game].dataFolder = nodePath.join(
-            wh3FolderPath,
-            "/data/",
-          );
-          mainWindow?.webContents.send("setWarhammer3Folder", wh3FolderPath);
-          if (appData.gamesToGameFolderPaths[game].gamePath == undefined)
-            return;
-          const calculatedContentPath = nodePath.join(
-            appData.gamesToGameFolderPaths[game].gamePath as string,
-            "..",
-            "..",
-            "workshop",
-            "content",
-            gameToSteamId[game],
-          );
-          if (fs.existsSync(calculatedContentPath)) {
-            appData.gamesToGameFolderPaths[game].contentFolder =
-              calculatedContentPath;
-            mainWindow?.webContents.send(
-              "setContentFolder",
-              calculatedContentPath,
-            );
-          }
-          // shogun 2 doesn't use the content folder, puts subscribed to mods directly into data
-          if (requestedGame == "shogun2") {
-            appData.gamesToGameFolderPaths[game].contentFolder = wh3FolderPath;
-            mainWindow?.webContents.send("setContentFolder", wh3FolderPath);
-          }
-          refreshModsIfFoldersValid(requestedGame);
+        // shogun 2 doesn't use the content folder, puts subscribed to mods directly into data
+        if (requestedGame == "shogun2") {
+          appData.gamesToGameFolderPaths[game].contentFolder = wh3FolderPath;
+          mainWindow?.webContents.send("setContentFolder", wh3FolderPath);
         }
-      } catch (e) {
-        console.log(e);
+        refreshModsIfFoldersValid(requestedGame);
       }
-    },
-  );
-  ipcMain.handle(
-    "getSteamCollectionName",
-    async (event, steamCollectionURL: string) => {
-      try {
-        console.log("getting steamCollectionURL name:", steamCollectionURL);
-        const res = await fetch(steamCollectionURL);
-        const cheerioObj = cheerio.load(await res.text());
-        const collectionTitle = cheerioObj(".collectionHeaderContent")
-          .find(".workshopItemTitle")
-          .text();
-        console.log("collection title:", collectionTitle);
-        return collectionTitle;
-      } catch (e) {
-        console.log(e);
+    } catch (e) {
+      console.log(e);
+    }
+  });
+  const getCurrentGameFolder = () => appData.gamesToGameFolderPaths[appData.currentGame]?.gamePath;
+  const isCurrentGameRunning = async () => {
+    if (appData.isWH3Running) return true;
+    try {
+      return (await findGameProcessIds(gameToProcessName[appData.currentGame])).length > 0;
+    } catch (error) {
+      console.warn("Could not check whether the game is running before Workshop staging cleanup:", error);
+      return false;
+    }
+  };
+  ipcMain.handle("getWorkshopModStagingInfo", async () => {
+    const gamePath = getCurrentGameFolder();
+    if (!gamePath) return { success: true, size: 0, hasContents: false };
+
+    try {
+      return { success: true, ...(await getWorkshopModStagingFolderInfo(gamePath)) };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const message = i18n.t("automaticWorkshopStagingFolderSizeFailed", { error: detail });
+      console.error(message, error);
+      return { success: false, size: 0, hasContents: false, error: message };
+    }
+  });
+  ipcMain.handle("clearWorkshopModStaging", async () => {
+    const gamePath = getCurrentGameFolder();
+    if (!gamePath) {
+      const message = i18n.t("automaticWorkshopStagingClearFailed", { error: "No game folder is configured." });
+      reportWorkshopCleanupWarning(message);
+      return { success: false, code: "CLEANUP_FAILED", error: message };
+    }
+
+    if (await isCurrentGameRunning()) {
+      const message = i18n.t("automaticWorkshopStagingGameRunning");
+      reportWorkshopCleanupWarning(message);
+      return { success: false, code: "GAME_RUNNING", error: message };
+    }
+
+    try {
+      const removed = await cleanupWorkshopModStaging(gamePath);
+      if (appData.workshopStagingCleanupGamePath === gamePath) {
+        appData.workshopStagingCleanupPending = false;
+        appData.workshopStagingCleanupGamePath = undefined;
       }
-      return "";
-    },
-  );
-  ipcMain.handle(
-    "translate",
-    async (
-      event,
-      translationId: string,
-      options?: Record<string, string | number>,
-    ) => {
-      if (i18n.language != appData.currentLanguage) {
-        await i18n.changeLanguage(appData.currentLanguage);
+      return { success: true, removed };
+    } catch (error) {
+      if (await isCurrentGameRunning()) {
+        const message = i18n.t("automaticWorkshopStagingGameRunning");
+        reportWorkshopCleanupWarning(message, error);
+        return { success: false, code: "GAME_RUNNING", error: message };
       }
-      return i18n.t(translationId, options);
-    },
-  );
+
+      const detail = error instanceof Error ? error.message : String(error);
+      const message = i18n.t("automaticWorkshopStagingClearFailed", { error: detail });
+      reportWorkshopCleanupWarning(message, error);
+      return { success: false, code: "CLEANUP_FAILED", error: message };
+    }
+  });
+  ipcMain.handle("getSteamCollectionName", async (event, steamCollectionURL: string) => {
+    try {
+      console.log("getting steamCollectionURL name:", steamCollectionURL);
+      const res = await fetch(steamCollectionURL);
+      const cheerioObj = cheerio.load(await res.text());
+      const collectionTitle = cheerioObj(".collectionHeaderContent").find(".workshopItemTitle").text();
+      console.log("collection title:", collectionTitle);
+      return collectionTitle;
+    } catch (e) {
+      console.log(e);
+    }
+    return "";
+  });
+  ipcMain.handle("translate", async (event, translationId: string, options?: Record<string, string | number>) => {
+    if (i18n.language != appData.currentLanguage) {
+      await i18n.changeLanguage(appData.currentLanguage);
+    }
+    return i18n.t(translationId, options);
+  });
   ipcMain.handle(
     "translateAll",
     async (
@@ -11486,49 +12035,42 @@ export const registerIpcMainListeners = (
       return { success: true, updated, added, failed };
     },
   );
-  ipcMain.on(
-    "copyToDataAsSymbolicLink",
-    async (event, modPathsToCopy?: string[]) => {
-      try {
-        console.log("copyToDataAsSymbolicLink modPathsToCopy:", modPathsToCopy);
-        const mods = await getMods(log);
-        let withoutDataMods = mods.filter((mod) => !mod.isInData);
-        if (modPathsToCopy) {
-          withoutDataMods = withoutDataMods.filter((mod) =>
-            modPathsToCopy.some((modPathToCopy) => modPathToCopy == mod.path),
-          );
-        }
-        const gamePath =
-          appData.gamesToGameFolderPaths[appData.currentGame].gamePath;
-        if (!gamePath) return;
-        const results = await Promise.allSettled(
-          withoutDataMods.map(async (mod) => {
-            const destinationPath = nodePath.join(gamePath, "data", mod.name);
-            mainWindow?.webContents.send(
-              "handleLog",
-              `CREATING SYMLINK of ${mod.path} to ${gamePath}\\data\\${mod.name}`,
-            );
-            await fsExtra.symlink(mod.path, destinationPath);
-            return destinationPath;
-          }),
+  ipcMain.on("copyToDataAsSymbolicLink", async (event, modPathsToCopy?: string[]) => {
+    try {
+      console.log("copyToDataAsSymbolicLink modPathsToCopy:", modPathsToCopy);
+      const mods = await getMods(log);
+      let withoutDataMods = mods.filter((mod) => !mod.isInData);
+      if (modPathsToCopy) {
+        withoutDataMods = withoutDataMods.filter((mod) =>
+          modPathsToCopy.some((modPathToCopy) => modPathToCopy == mod.path),
         );
-        const pathsOfNewSymLinks: string[] = [];
-        const failures: unknown[] = [];
-        for (const result of results) {
-          if (result.status === "fulfilled")
-            pathsOfNewSymLinks.push(result.value);
-          else failures.push(result.reason);
-        }
-        reportFileOperationFailures("Create symbolic links in Data", failures);
-        // Should be tracked automatically by the data watcher, but chokidar can choke on symlinks here.
-        await Promise.all(
-          pathsOfNewSymLinks.map((path) => onNewPackFound(path)),
-        );
-      } catch (error) {
-        reportFileOperationFailures("Create symbolic links in Data", [error]);
       }
-    },
-  );
+      const gamePath = appData.gamesToGameFolderPaths[appData.currentGame].gamePath;
+      if (!gamePath) return;
+      const results = await Promise.allSettled(
+        withoutDataMods.map(async (mod) => {
+          const destinationPath = nodePath.join(gamePath, "data", mod.name);
+          mainWindow?.webContents.send(
+            "handleLog",
+            `CREATING SYMLINK of ${mod.path} to ${gamePath}\\data\\${mod.name}`,
+          );
+          await fsExtra.symlink(mod.path, destinationPath);
+          return destinationPath;
+        }),
+      );
+      const pathsOfNewSymLinks: string[] = [];
+      const failures: unknown[] = [];
+      for (const result of results) {
+        if (result.status === "fulfilled") pathsOfNewSymLinks.push(result.value);
+        else failures.push(result.reason);
+      }
+      reportFileOperationFailures("Create symbolic links in Data", failures);
+      // Should be tracked automatically by the data watcher, but chokidar can choke on symlinks here.
+      await Promise.all(pathsOfNewSymLinks.map((path) => onNewPackFound(path)));
+    } catch (error) {
+      reportFileOperationFailures("Create symbolic links in Data", [error]);
+    }
+  });
   ipcMain.on("cleanData", async () => {
     try {
       const mods = await getMods(log);
@@ -11615,7 +12157,6 @@ export const registerIpcMainListeners = (
     }
   });
   ipcMain.on("saveConfig", (event, payload: ConfigSavePayload) => {
-    console.log("saveConfig");
     const { config } = payload;
 
     applyConfigSavePayloadToAppData(payload);
@@ -13283,532 +13824,527 @@ export const registerIpcMainListeners = (
           });
         }
 
-        const nodesByTechnologyKey = new Map<
-          string,
-          {
-            finalNode: SaveTechnologyPackPayload["nodes"][number];
-            sourceTechnologyKey: string;
-          }
-        >();
-        for (const { sourceNode, finalNode } of remappedNodes) {
-          if (!nodesByTechnologyKey.has(finalNode.technologyKey)) {
-            nodesByTechnologyKey.set(finalNode.technologyKey, {
-              finalNode,
-              sourceTechnologyKey: sourceNode.technologyKey,
-            });
-          }
-        }
-        const normalizeComparableString = (value: string | null | undefined) =>
-          (value || "").trim();
-        const normalizeComparableNumber = (value: string | undefined) =>
-          parseOptionalNumber(value, 0).toString();
-        const normalizeComparableBool = (value: string | undefined) =>
-          parseOptionalBool(value, false) ? "true" : "false";
-        const normalizeComparableIconName = (value: string | undefined) =>
-          normalizeComparableString(value)
-            .replace(/\.(png|jpg|jpeg)$/i, "")
-            .toLowerCase();
-        const buildEffectsSignature = (
-          effects: { effectKey?: string; value?: string }[] | undefined,
-        ) =>
-          JSON.stringify(
-            (effects || [])
-              .map((effect) => ({
-                effectKey: normalizeComparableString(effect.effectKey),
-                value: normalizeComparableString(effect.value),
-              }))
-              .filter((effect) => effect.effectKey !== "")
-              .sort((left, right) =>
-                left.effectKey === right.effectKey
-                  ? left.value.localeCompare(right.value)
-                  : left.effectKey.localeCompare(right.effectKey),
-              ),
-          );
-        const getLoc = (locId: string) =>
-          getLocById(technologyData.locs, locId);
-        const resolveTechnologyLoc = (locId: string) => {
-          const localized = getLoc(locId);
-          return resolveTextReplacements(localized, getLoc) || localized;
-        };
-        const getOriginalTechnologyDisplayName = (technologyKey: string) =>
-          resolveTechnologyLoc(`technologies_onscreen_name_${technologyKey}`) ||
-          technologyKey;
-        const getOriginalTechnologyShortDescription = (technologyKey: string) =>
-          resolveTechnologyLoc(
-            `technologies_short_description_${technologyKey}`,
-          ) || "";
-        const getOriginalTechnologyLongDescription = (technologyKey: string) =>
-          resolveTechnologyLoc(
-            `technologies_long_description_${technologyKey}`,
-          ) || "";
-        const techSchema = getPreferredSchema("technologies_tables");
-        const technologyFieldNames = new Set(
-          techSchema.fields.map((field) => field.name),
-        );
-        const technologyEntries = [...nodesByTechnologyKey.entries()].map(
-          ([technologyKey, { finalNode, sourceTechnologyKey }]) => {
-            const originalTechnologyRow =
-              technologyData.technologyRowsByKey[sourceTechnologyKey];
-            const nextTechnologyRow = {
-              key: technologyKey,
-              research_points_required:
-                finalNode.researchPointsRequired.toString(),
-              icon_name: getTechnologyIconNameFromPath(finalNode.iconPath),
-              is_hidden: finalNode.isHidden ? "true" : "false",
-              building_level: getTechnologyBuildingLevelForWrite(
-                finalNode.buildingLevel,
-                originalTechnologyRow,
-              ),
-            };
-            const rowDifferences = {
-              missingOriginalRow: !originalTechnologyRow,
-              key:
-                technologyFieldNames.has("key") &&
-                normalizeComparableString(originalTechnologyRow?.key) !==
-                  normalizeComparableString(nextTechnologyRow.key),
-              research_points_required:
-                technologyFieldNames.has("research_points_required") &&
-                normalizeComparableNumber(
-                  originalTechnologyRow?.research_points_required,
-                ) !==
-                  normalizeComparableNumber(
-                    nextTechnologyRow.research_points_required,
-                  ),
-              icon_name:
-                technologyFieldNames.has("icon_name") &&
-                normalizeComparableIconName(
-                  originalTechnologyRow?.icon_name,
-                ) !== normalizeComparableIconName(nextTechnologyRow.icon_name),
-              is_hidden:
-                technologyFieldNames.has("is_hidden") &&
-                normalizeComparableBool(originalTechnologyRow?.is_hidden) !==
-                  normalizeComparableBool(nextTechnologyRow.is_hidden),
-              building_level:
-                technologyFieldNames.has("building_level") &&
-                normalizeComparableString(
-                  originalTechnologyRow?.building_level,
-                ) !==
-                  normalizeComparableString(nextTechnologyRow.building_level),
-            };
-            const basicDataChanged =
-              rowDifferences.missingOriginalRow ||
-              rowDifferences.key ||
-              rowDifferences.research_points_required ||
-              rowDifferences.icon_name ||
-              rowDifferences.is_hidden ||
-              rowDifferences.building_level;
-            const locChanged =
-              technologyKey !== sourceTechnologyKey ||
-              normalizeComparableString(
-                getOriginalTechnologyDisplayName(sourceTechnologyKey),
-              ) !==
-                normalizeComparableString(
-                  finalNode.displayName || technologyKey,
-                ) ||
-              normalizeComparableString(
-                getOriginalTechnologyShortDescription(sourceTechnologyKey),
-              ) !== normalizeComparableString(finalNode.shortDescription) ||
-              normalizeComparableString(
-                getOriginalTechnologyLongDescription(sourceTechnologyKey),
-              ) !== normalizeComparableString(finalNode.longDescription);
-            const effectsChanged =
-              technologyKey !== sourceTechnologyKey ||
-              buildEffectsSignature(
-                technologyData.technologyToEffects[sourceTechnologyKey],
-              ) !== buildEffectsSignature(finalNode.effects);
-            return {
-              technologyKey,
-              sourceTechnologyKey,
-              finalNode,
-              rowDifferences,
-              shouldWriteTechnologyRow:
-                shouldCloneTechnologies || basicDataChanged,
-              shouldWriteEffects:
-                shouldCloneTechnologies || effectsChanged || basicDataChanged,
-              shouldWriteLoc: shouldCloneTechnologies || locChanged,
-            };
-          },
-        );
-        const techRows = technologyEntries
-          .filter(({ shouldWriteTechnologyRow }) => shouldWriteTechnologyRow)
-          .map(({ technologyKey, sourceTechnologyKey, finalNode }) => {
-            const originalTechnologyRow =
-              technologyData.technologyRowsByKey[sourceTechnologyKey];
-            const isBrandNewTechnology = !originalTechnologyRow;
-            const shouldAllocateNewUniqueIndex =
-              shouldCloneTechnologies || isBrandNewTechnology;
-            return buildRowFromSchema(techSchema.fields, {
-              ...(originalTechnologyRow || {}),
-              key: technologyKey,
-              research_points_required:
-                finalNode.researchPointsRequired.toString(),
-              icon_name: getTechnologyIconNameFromPath(finalNode.iconPath),
-              is_hidden: finalNode.isHidden ? "true" : "false",
-              building_level: getTechnologyBuildingLevelForWrite(
-                finalNode.buildingLevel,
-                originalTechnologyRow,
-              ),
-              unique_index: shouldAllocateNewUniqueIndex
-                ? allocateTechnologyUniqueIndex(usedTechnologyUniqueIndexes)
-                : originalTechnologyRow.unique_index || "",
-              is_military: isBrandNewTechnology
-                ? "true"
-                : originalTechnologyRow.is_military,
-            });
-          });
-        if (techRows.length > 0) {
-          const buffer = await buildDBFileBuffer(
-            techSchema.version,
-            techRows,
-            techSchema.fields,
-          );
-          packFiles.push({
-            name: `db\\technologies_tables\\${tableName}`,
-            file_size: buffer.length,
-            buffer,
+      const nodesByTechnologyKey = new Map<
+        string,
+        { finalNode: SaveTechnologyPackPayload["nodes"][number]; sourceTechnologyKey: string }
+      >();
+      for (const { sourceNode, finalNode } of remappedNodes) {
+        if (!nodesByTechnologyKey.has(finalNode.technologyKey)) {
+          nodesByTechnologyKey.set(finalNode.technologyKey, {
+            finalNode,
+            sourceTechnologyKey: sourceNode.technologyKey,
           });
         }
-        const techEffectsSchema = getPreferredSchema(
-          "technology_effects_junction_tables",
-        );
-        const techEffectsRows: (string | boolean)[][] = [];
-        const seenTechnologyEffects = new Set<string>();
-        let defaultTechnologyEffectScopeFallbackCount = 0;
-        for (const {
-          technologyKey,
-          sourceTechnologyKey,
-          finalNode,
-          shouldWriteEffects,
-        } of technologyEntries) {
-          if (!shouldWriteEffects) continue;
-          for (const effect of finalNode.effects || []) {
-            const effectKey = `${effect.effectKey || ""}`.trim();
-            if (!effectKey) continue;
-            const rowKey = `${technologyKey}|${effectKey}`;
-            if (seenTechnologyEffects.has(rowKey)) continue;
-            seenTechnologyEffects.add(rowKey);
-            const resolvedEffectScope =
-              technologyData.technologyEffectRowsByKey[sourceTechnologyKey]?.[
-                effectKey
-              ]?.effect_scope ||
-              technologyData.technologyEffectScopesByKey[effectKey] ||
-              "default";
-            if (resolvedEffectScope === "default") {
-              defaultTechnologyEffectScopeFallbackCount += 1;
-            }
-            techEffectsRows.push(
-              buildRowFromSchema(techEffectsSchema.fields, {
-                ...(technologyData.technologyEffectRowsByKey[
-                  sourceTechnologyKey
-                ]?.[effectKey] || {}),
-                technology: technologyKey,
-                effect: effectKey,
-                effect_scope: resolvedEffectScope,
-                value: effect.value || "",
-              }),
-            );
-          }
-        }
-        if (techEffectsRows.length > 0) {
-          const buffer = await buildDBFileBuffer(
-            techEffectsSchema.version,
-            techEffectsRows,
-            techEffectsSchema.fields,
-          );
-          packFiles.push({
-            name: `db\\technology_effects_junction_tables\\${tableName}`,
-            file_size: buffer.length,
-            buffer,
-          });
-        }
-        const locRowsByKey: Record<string, string> = {};
-        for (const {
-          technologyKey,
-          finalNode,
-          shouldWriteLoc,
-        } of technologyEntries) {
-          if (!shouldWriteLoc) continue;
-          locRowsByKey[`technologies_onscreen_name_${technologyKey}`] =
-            finalNode.displayName || technologyKey;
-          if (finalNode.shortDescription !== undefined) {
-            locRowsByKey[`technologies_short_description_${technologyKey}`] =
-              finalNode.shortDescription || "";
-          }
-          if (finalNode.longDescription !== undefined) {
-            locRowsByKey[`technologies_long_description_${technologyKey}`] =
-              finalNode.longDescription || "";
-          }
-        }
-        for (const remappedGroupKey of uiGroupKeyRemap.values()) {
-          locRowsByKey[
-            `technology_ui_groups_optional_display_name_${remappedGroupKey}`
-          ] = "";
-          locRowsByKey[
-            `technology_ui_groups_optional_display_desctiption_${remappedGroupKey}`
-          ] = "";
-        }
-        const locRows = Object.entries(locRowsByKey).map(
-          ([key, text]) => [key, text, false] as (string | boolean)[],
-        );
-        if (locRows.length > 0) {
-          const buffer = await buildLocFileBuffer(locRows);
-          packFiles.push({
-            name: `text\\db\\${tableName}.loc`,
-            file_size: buffer.length,
-            buffer,
-          });
-        }
-        if (packFiles.length < 1)
-          return { success: false, error: "No technology data to save" };
-        await writePack(packFiles, packPath);
-        cachedTechnologyData = undefined;
-        cachedTechnologyDataKey = undefined;
-        return {
-          success: true,
-          packPath,
-          packName: finalPackName,
-          warning:
-            defaultTechnologyEffectScopeFallbackCount > 0
-              ? `${defaultTechnologyEffectScopeFallbackCount} technology effect row${defaultTechnologyEffectScopeFallbackCount === 1 ? "" : "s"} used fallback effect_scope 'default'.`
-              : undefined,
-        };
-      } catch (error: any) {
-        console.error("Failed to save technology tree:", error);
-        return { success: false, error: error?.message || String(error) };
       }
-    },
-  );
-  ipcMain.handle(
-    "saveTechnologyChanges",
-    async (event, data: SaveTechnologyChangesPayload) => {
-      try {
-        const dataFolder =
-          appData.gamesToGameFolderPaths[appData.currentGame]?.dataFolder;
-        if (!dataFolder)
-          return { success: false, error: "Data folder not found" };
-        const technologyData = await ensureTechnologyData();
-        if (!technologyData)
+      const normalizeComparableString = (value: string | null | undefined) => (value || "").trim();
+      const normalizeComparableNumber = (value: string | undefined) => parseOptionalNumber(value, 0).toString();
+      const normalizeComparableBool = (value: string | undefined) =>
+        parseOptionalBool(value, false) ? "true" : "false";
+      const normalizeComparableIconName = (value: string | undefined) =>
+        normalizeComparableString(value)
+          .replace(/\.(png|jpg|jpeg)$/i, "")
+          .toLowerCase();
+      const buildEffectsSignature = (effects: { effectKey?: string; value?: string }[] | undefined) =>
+        JSON.stringify(
+          (effects || [])
+            .map((effect) => ({
+              effectKey: normalizeComparableString(effect.effectKey),
+              value: normalizeComparableString(effect.value),
+            }))
+            .filter((effect) => effect.effectKey !== "")
+            .sort((left, right) =>
+              left.effectKey === right.effectKey
+                ? left.value.localeCompare(right.value)
+                : left.effectKey.localeCompare(right.effectKey),
+            ),
+        );
+      const getLoc = (locId: string) => getLocById(technologyData.locs, locId);
+      const resolveTechnologyLoc = (locId: string) => {
+        const localized = getLoc(locId);
+        return resolveTextReplacements(localized, getLoc) || localized;
+      };
+      const getOriginalTechnologyDisplayName = (technologyKey: string) =>
+        resolveTechnologyLoc(`technologies_onscreen_name_${technologyKey}`) || technologyKey;
+      const getOriginalTechnologyShortDescription = (technologyKey: string) =>
+        resolveTechnologyLoc(`technologies_short_description_${technologyKey}`) || "";
+      const getOriginalTechnologyLongDescription = (technologyKey: string) =>
+        resolveTechnologyLoc(`technologies_long_description_${technologyKey}`) || "";
+      const techSchema = getPreferredSchema("technologies_tables");
+      const technologyFieldNames = new Set(techSchema.fields.map((field) => field.name));
+      const technologyEntries = [...nodesByTechnologyKey.entries()].map(
+        ([technologyKey, { finalNode, sourceTechnologyKey }]) => {
+          const originalTechnologyRow = technologyData.technologyRowsByKey[sourceTechnologyKey];
+          const nextTechnologyRow = {
+            key: technologyKey,
+            research_points_required: finalNode.researchPointsRequired.toString(),
+            icon_name: getTechnologyIconNameFromPath(finalNode.iconPath),
+            is_hidden: finalNode.isHidden ? "true" : "false",
+            building_level: getTechnologyBuildingLevelForWrite(finalNode.buildingLevel, originalTechnologyRow),
+          };
+          const rowDifferences = {
+            missingOriginalRow: !originalTechnologyRow,
+            key:
+              technologyFieldNames.has("key") &&
+              normalizeComparableString(originalTechnologyRow?.key) !==
+                normalizeComparableString(nextTechnologyRow.key),
+            research_points_required:
+              technologyFieldNames.has("research_points_required") &&
+              normalizeComparableNumber(originalTechnologyRow?.research_points_required) !==
+                normalizeComparableNumber(nextTechnologyRow.research_points_required),
+            icon_name:
+              technologyFieldNames.has("icon_name") &&
+              normalizeComparableIconName(originalTechnologyRow?.icon_name) !==
+                normalizeComparableIconName(nextTechnologyRow.icon_name),
+            is_hidden:
+              technologyFieldNames.has("is_hidden") &&
+              normalizeComparableBool(originalTechnologyRow?.is_hidden) !==
+                normalizeComparableBool(nextTechnologyRow.is_hidden),
+            building_level:
+              technologyFieldNames.has("building_level") &&
+              normalizeComparableString(originalTechnologyRow?.building_level) !==
+                normalizeComparableString(nextTechnologyRow.building_level),
+          };
+          const basicDataChanged =
+            rowDifferences.missingOriginalRow ||
+            rowDifferences.key ||
+            rowDifferences.research_points_required ||
+            rowDifferences.icon_name ||
+            rowDifferences.is_hidden ||
+            rowDifferences.building_level;
+          const locChanged =
+            technologyKey !== sourceTechnologyKey ||
+            normalizeComparableString(getOriginalTechnologyDisplayName(sourceTechnologyKey)) !==
+              normalizeComparableString(finalNode.displayName || technologyKey) ||
+            normalizeComparableString(getOriginalTechnologyShortDescription(sourceTechnologyKey)) !==
+              normalizeComparableString(finalNode.shortDescription) ||
+            normalizeComparableString(getOriginalTechnologyLongDescription(sourceTechnologyKey)) !==
+              normalizeComparableString(finalNode.longDescription);
+          const effectsChanged =
+            technologyKey !== sourceTechnologyKey ||
+            buildEffectsSignature(technologyData.technologyToEffects[sourceTechnologyKey]) !==
+              buildEffectsSignature(finalNode.effects);
+          return {
+            technologyKey,
+            sourceTechnologyKey,
+            finalNode,
+            rowDifferences,
+            shouldWriteTechnologyRow: shouldCloneTechnologies || basicDataChanged,
+            shouldWriteEffects: shouldCloneTechnologies || effectsChanged || basicDataChanged,
+            shouldWriteLoc: shouldCloneTechnologies || locChanged,
+          };
+        },
+      );
+      const techRows = technologyEntries
+        .filter(({ shouldWriteTechnologyRow }) => shouldWriteTechnologyRow)
+        .map(({ technologyKey, sourceTechnologyKey, finalNode }) => {
+          const originalTechnologyRow = technologyData.technologyRowsByKey[sourceTechnologyKey];
+          const isBrandNewTechnology = !originalTechnologyRow;
+          const shouldAllocateNewUniqueIndex = shouldCloneTechnologies || isBrandNewTechnology;
+          return buildRowFromSchema(techSchema.fields, {
+            ...(originalTechnologyRow || {}),
+            key: technologyKey,
+            research_points_required: finalNode.researchPointsRequired.toString(),
+            icon_name: getTechnologyIconNameFromPath(finalNode.iconPath),
+            is_hidden: finalNode.isHidden ? "true" : "false",
+            building_level: getTechnologyBuildingLevelForWrite(finalNode.buildingLevel, originalTechnologyRow),
+            unique_index: shouldAllocateNewUniqueIndex
+              ? allocateTechnologyUniqueIndex(usedTechnologyUniqueIndexes)
+              : originalTechnologyRow.unique_index || "",
+            is_military: isBrandNewTechnology ? "true" : originalTechnologyRow.is_military,
+          });
+        });
+      if (techRows.length > 0) {
+        const buffer = await buildDBFileBuffer(techSchema.version, techRows, techSchema.fields);
+        packFiles.push({ name: `db\\technologies_tables\\${tableName}`, file_size: buffer.length, buffer });
+      }
+      const techEffectsSchema = getPreferredSchema("technology_effects_junction_tables");
+      const techEffectsRows: (string | boolean)[][] = [];
+      const seenTechnologyEffects = new Set<string>();
+      let defaultTechnologyEffectScopeFallbackCount = 0;
+      for (const { technologyKey, sourceTechnologyKey, finalNode, shouldWriteEffects } of technologyEntries) {
+        if (!shouldWriteEffects) continue;
+        for (const effect of finalNode.effects || []) {
+          const effectKey = `${effect.effectKey || ""}`.trim();
+          if (!effectKey) continue;
+          const rowKey = `${technologyKey}|${effectKey}`;
+          if (seenTechnologyEffects.has(rowKey)) continue;
+          seenTechnologyEffects.add(rowKey);
+          const resolvedEffectScope =
+            technologyData.technologyEffectRowsByKey[sourceTechnologyKey]?.[effectKey]?.effect_scope ||
+            technologyData.technologyEffectScopesByKey[effectKey] ||
+            "default";
+          if (resolvedEffectScope === "default") {
+            defaultTechnologyEffectScopeFallbackCount += 1;
+          }
+          techEffectsRows.push(
+            buildRowFromSchema(techEffectsSchema.fields, {
+              ...(technologyData.technologyEffectRowsByKey[sourceTechnologyKey]?.[effectKey] || {}),
+              technology: technologyKey,
+              effect: effectKey,
+              effect_scope: resolvedEffectScope,
+              value: effect.value || "",
+            }),
+          );
+        }
+      }
+      if (techEffectsRows.length > 0) {
+        const buffer = await buildDBFileBuffer(techEffectsSchema.version, techEffectsRows, techEffectsSchema.fields);
+        packFiles.push({
+          name: `db\\technology_effects_junction_tables\\${tableName}`,
+          file_size: buffer.length,
+          buffer,
+        });
+      }
+      const locRowsByKey: Record<string, string> = {};
+      for (const { technologyKey, finalNode, shouldWriteLoc } of technologyEntries) {
+        if (!shouldWriteLoc) continue;
+        locRowsByKey[`technologies_onscreen_name_${technologyKey}`] = finalNode.displayName || technologyKey;
+        if (finalNode.shortDescription !== undefined) {
+          locRowsByKey[`technologies_short_description_${technologyKey}`] = finalNode.shortDescription || "";
+        }
+        if (finalNode.longDescription !== undefined) {
+          locRowsByKey[`technologies_long_description_${technologyKey}`] = finalNode.longDescription || "";
+        }
+      }
+      for (const remappedGroupKey of uiGroupKeyRemap.values()) {
+        locRowsByKey[`technology_ui_groups_optional_display_name_${remappedGroupKey}`] = "";
+        locRowsByKey[`technology_ui_groups_optional_display_desctiption_${remappedGroupKey}`] = "";
+      }
+      const locRows = Object.entries(locRowsByKey).map(([key, text]) => [key, text, false] as (string | boolean)[]);
+      if (locRows.length > 0) {
+        const buffer = await buildLocFileBuffer(locRows);
+        packFiles.push({ name: `text\\db\\${tableName}.loc`, file_size: buffer.length, buffer });
+      }
+      if (packFiles.length < 1) return { success: false, error: "No technology data to save" };
+      await writePack(packFiles, packPath);
+      cachedTechnologyData = undefined;
+      cachedTechnologyDataKey = undefined;
+      return {
+        success: true,
+        packPath,
+        packName: finalPackName,
+        warning:
+          defaultTechnologyEffectScopeFallbackCount > 0
+            ? `${defaultTechnologyEffectScopeFallbackCount} technology effect row${defaultTechnologyEffectScopeFallbackCount === 1 ? "" : "s"} used fallback effect_scope 'default'.`
+            : undefined,
+      };
+    } catch (error: any) {
+      console.error("Failed to save technology tree:", error);
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+  ipcMain.handle("saveTechnologyChanges", async (event, data: SaveTechnologyChangesPayload) => {
+    try {
+      const dataFolder = appData.gamesToGameFolderPaths[appData.currentGame]?.dataFolder;
+      if (!dataFolder) return { success: false, error: "Data folder not found" };
+      const technologyData = await ensureTechnologyData();
+      if (!technologyData) return { success: false, error: "Technology data could not be loaded" };
+      const usedTechnologyUniqueIndexes = buildUsedTechnologyUniqueIndexes(technologyData.technologyRowsByKey);
+      const defaultModdersPrefix = normalizeGeneratedPrefix(appData.moddersPrefix);
+      const generationTimestamp = Date.now().toString();
+      const resolveGenerationTemplate = (
+        template: string,
+        variables: { prefix: string; nodeSet: string; row: string; column: string; timestamp?: string },
+      ) =>
+        template
+          .replaceAll("${prefix}", variables.prefix)
+          .replaceAll("${xxx}", variables.prefix)
+          .replaceAll("${nodeSet}", variables.nodeSet)
+          .replaceAll("${yyy}", variables.nodeSet)
+          .replaceAll("${timestamp}", variables.timestamp ?? "")
+          .replaceAll("${row}", variables.row)
+          .replaceAll("${r}", variables.row)
+          .replaceAll("${column}", variables.column)
+          .replaceAll("${c}", variables.column);
+      const tableName = resolveGenerationTemplate(
+        data.tableNameOverride?.trim() || "${prefix}_${nodeSet}_${timestamp}",
+        {
+          prefix: defaultModdersPrefix || "custom",
+          nodeSet: data.setKey,
+          row: "",
+          column: "",
+          timestamp: generationTimestamp,
+        },
+      );
+      const finalPackName = data.packName.endsWith(".pack") ? data.packName : `${data.packName}.pack`;
+      const packPath = nodePath.join(data.packDirectory || dataFolder, finalPackName);
+      const buildRowFromSchema = (
+        dbFields: DBField[],
+        values: Record<string, string | boolean>,
+      ): (string | boolean)[] => {
+        return dbFields.map((field) => {
+          if (values[field.name] !== undefined) return values[field.name];
+          return field.default_value ?? "";
+        });
+      };
+      const buildDBFileBuffer = async (
+        version: number,
+        rows: (string | boolean)[][],
+        dbFields: DBField[],
+      ): Promise<Buffer> => {
+        const parts: Buffer[] = [];
+        parts.push(Buffer.from([0xfc, 0xfd, 0xfe, 0xff]));
+        const versionBuffer = Buffer.alloc(4);
+        versionBuffer.writeInt32LE(version, 0);
+        parts.push(versionBuffer);
+        parts.push(Buffer.from([0x01]));
+        const countBuffer = Buffer.alloc(4);
+        countBuffer.writeInt32LE(rows.length, 0);
+        parts.push(countBuffer);
+        for (const row of rows) {
+          for (let i = 0; i < dbFields.length; i++) {
+            parts.push(await typeToBuffer(dbFields[i].field_type, row[i]));
+          }
+        }
+        return Buffer.concat(parts);
+      };
+      const defaultTableVersions = await getDefaultTableVersions();
+      const getPreferredSchema = (tableNameToResolve: string) => {
+        const versions = DBNameToDBVersions[appData.currentGame][tableNameToResolve];
+        if (!versions || versions.length === 0) throw new Error(`No schema found for ${tableNameToResolve}`);
+        const defaultVersion = defaultTableVersions?.[tableNameToResolve];
+        return versions.find((version) => version.version === defaultVersion) || versions[0];
+      };
+      const packFiles: NewPackedFile[] = [];
+      const newNodeKeys = new Set<string>();
+      for (const newNode of data.newNodes || []) {
+        if (newNodeKeys.has(newNode.nodeKey)) {
+          return { success: false, error: `Duplicate technology node key: ${newNode.nodeKey}` };
+        }
+        if (technologyData.nodesByKey[newNode.nodeKey]) {
+          return { success: false, error: `Technology node key already exists: ${newNode.nodeKey}` };
+        }
+        newNodeKeys.add(newNode.nodeKey);
+      }
+      const newTechnologyDefinitions = new Map<string, string>();
+      for (const newNode of data.newNodes || []) {
+        if (technologyData.technologyRowsByKey[newNode.technologyKey]) continue;
+        const definition = JSON.stringify({
+          displayName: newNode.displayName,
+          shortDescription: newNode.shortDescription ?? "",
+          longDescription: newNode.longDescription ?? "",
+          researchPointsRequired: newNode.researchPointsRequired,
+          iconPath: newNode.iconPath ?? "",
+          isHidden: !!newNode.isHidden,
+          buildingLevel: newNode.buildingLevel ?? "",
+          effects: (newNode.effects || [])
+            .map((effect) => ({ effectKey: effect.effectKey, value: effect.value || "" }))
+            .sort((left, right) =>
+              left.effectKey === right.effectKey
+                ? left.value.localeCompare(right.value)
+                : left.effectKey.localeCompare(right.effectKey),
+            ),
+        });
+        const previousDefinition = newTechnologyDefinitions.get(newNode.technologyKey);
+        if (previousDefinition && previousDefinition !== definition) {
           return {
             success: false,
-            error: "Technology data could not be loaded",
+            error: `Duplicate custom technology key has conflicting definitions: ${newNode.technologyKey}`,
           };
-        const usedTechnologyUniqueIndexes = buildUsedTechnologyUniqueIndexes(
-          technologyData.technologyRowsByKey,
-        );
-        const defaultModdersPrefix = normalizeGeneratedPrefix(
-          appData.moddersPrefix,
-        );
-        const generationTimestamp = Date.now().toString();
-        const resolveGenerationTemplate = (
-          template: string,
-          variables: {
-            prefix: string;
-            nodeSet: string;
-            row: string;
-            column: string;
-            timestamp?: string;
-          },
-        ) =>
-          template
-            .replaceAll("${prefix}", variables.prefix)
-            .replaceAll("${xxx}", variables.prefix)
-            .replaceAll("${nodeSet}", variables.nodeSet)
-            .replaceAll("${yyy}", variables.nodeSet)
-            .replaceAll("${timestamp}", variables.timestamp ?? "")
-            .replaceAll("${row}", variables.row)
-            .replaceAll("${r}", variables.row)
-            .replaceAll("${column}", variables.column)
-            .replaceAll("${c}", variables.column);
-        const tableName = resolveGenerationTemplate(
-          data.tableNameOverride?.trim() || "${prefix}_${nodeSet}_${timestamp}",
-          {
-            prefix: defaultModdersPrefix || "custom",
-            nodeSet: data.setKey,
-            row: "",
-            column: "",
-            timestamp: generationTimestamp,
-          },
-        );
-        const finalPackName = data.packName.endsWith(".pack")
-          ? data.packName
-          : `${data.packName}.pack`;
-        const packPath = nodePath.join(
-          data.packDirectory || dataFolder,
-          finalPackName,
-        );
-        const buildRowFromSchema = (
-          dbFields: DBField[],
-          values: Record<string, string | boolean>,
-        ): (string | boolean)[] => {
-          return dbFields.map((field) => {
-            if (values[field.name] !== undefined) return values[field.name];
-            return field.default_value ?? "";
-          });
-        };
-        const buildDBFileBuffer = async (
-          version: number,
-          rows: (string | boolean)[][],
-          dbFields: DBField[],
-        ): Promise<Buffer> => {
-          const parts: Buffer[] = [];
-          parts.push(Buffer.from([0xfc, 0xfd, 0xfe, 0xff]));
-          const versionBuffer = Buffer.alloc(4);
-          versionBuffer.writeInt32LE(version, 0);
-          parts.push(versionBuffer);
-          parts.push(Buffer.from([0x01]));
-          const countBuffer = Buffer.alloc(4);
-          countBuffer.writeInt32LE(rows.length, 0);
-          parts.push(countBuffer);
-          for (const row of rows) {
-            for (let i = 0; i < dbFields.length; i++) {
-              parts.push(await typeToBuffer(dbFields[i].field_type, row[i]));
-            }
-          }
-          return Buffer.concat(parts);
-        };
-        const defaultTableVersions = await getDefaultTableVersions();
-        const getPreferredSchema = (tableNameToResolve: string) => {
-          const versions =
-            DBNameToDBVersions[appData.currentGame][tableNameToResolve];
-          if (!versions || versions.length === 0)
-            throw new Error(`No schema found for ${tableNameToResolve}`);
-          const defaultVersion = defaultTableVersions?.[tableNameToResolve];
-          return (
-            versions.find((version) => version.version === defaultVersion) ||
-            versions[0]
-          );
-        };
-        const packFiles: NewPackedFile[] = [];
-        const newNodeKeys = new Set<string>();
-        for (const newNode of data.newNodes || []) {
-          if (newNodeKeys.has(newNode.nodeKey)) {
-            return {
-              success: false,
-              error: `Duplicate technology node key: ${newNode.nodeKey}`,
-            };
-          }
-          if (technologyData.nodesByKey[newNode.nodeKey]) {
-            return {
-              success: false,
-              error: `Technology node key already exists: ${newNode.nodeKey}`,
-            };
-          }
-          newNodeKeys.add(newNode.nodeKey);
         }
-        const newTechnologyDefinitions = new Map<string, string>();
-        for (const newNode of data.newNodes || []) {
-          if (technologyData.technologyRowsByKey[newNode.technologyKey])
-            continue;
-          const definition = JSON.stringify({
-            displayName: newNode.displayName,
-            shortDescription: newNode.shortDescription ?? "",
-            longDescription: newNode.longDescription ?? "",
-            researchPointsRequired: newNode.researchPointsRequired,
-            iconPath: newNode.iconPath ?? "",
-            isHidden: !!newNode.isHidden,
-            buildingLevel: newNode.buildingLevel ?? "",
-            effects: (newNode.effects || [])
-              .map((effect) => ({
-                effectKey: effect.effectKey,
-                value: effect.value || "",
-              }))
-              .sort((left, right) =>
-                left.effectKey === right.effectKey
-                  ? left.value.localeCompare(right.value)
-                  : left.effectKey.localeCompare(right.effectKey),
-              ),
-          });
-          const previousDefinition = newTechnologyDefinitions.get(
-            newNode.technologyKey,
-          );
-          if (previousDefinition && previousDefinition !== definition) {
-            return {
-              success: false,
-              error: `Duplicate custom technology key has conflicting definitions: ${newNode.technologyKey}`,
-            };
+        newTechnologyDefinitions.set(newNode.technologyKey, definition);
+      }
+      const hasNodeDeletions = data.deletedNodeKeys && data.deletedNodeKeys.length > 0;
+      const hasNodeEdits = data.editedNodes && data.editedNodes.length > 0;
+      if (data.changedNodes.length > 0 || hasNodeDeletions || hasNodeEdits) {
+        const schema = getPreferredSchema("technology_nodes_tables");
+        const deletedNodeSet = new Set(data.deletedNodeKeys || []);
+        const dedupedRowsByNodeKey: Record<string, Record<string, string | boolean>> = {};
+        if (hasNodeDeletions) {
+          // Write complete replacement: all original nodes minus deleted ones
+          for (const [nodeKey, originalRow] of Object.entries(technologyData.nodeRowsByKey)) {
+            if (deletedNodeSet.has(nodeKey)) continue;
+            dedupedRowsByNodeKey[nodeKey] = { ...originalRow };
           }
-          newTechnologyDefinitions.set(newNode.technologyKey, definition);
         }
-        const hasNodeDeletions =
-          data.deletedNodeKeys && data.deletedNodeKeys.length > 0;
-        const hasNodeEdits = data.editedNodes && data.editedNodes.length > 0;
-        if (data.changedNodes.length > 0 || hasNodeDeletions || hasNodeEdits) {
-          const schema = getPreferredSchema("technology_nodes_tables");
-          const deletedNodeSet = new Set(data.deletedNodeKeys || []);
-          const dedupedRowsByNodeKey: Record<
-            string,
-            Record<string, string | boolean>
-          > = {};
-          if (hasNodeDeletions) {
-            // Write complete replacement: all original nodes minus deleted ones
-            for (const [nodeKey, originalRow] of Object.entries(
-              technologyData.nodeRowsByKey,
-            )) {
-              if (deletedNodeSet.has(nodeKey)) continue;
-              dedupedRowsByNodeKey[nodeKey] = { ...originalRow };
+        for (const changedNode of data.changedNodes) {
+          if (deletedNodeSet.has(changedNode.nodeKey)) continue;
+          const originalNodeRow = technologyData.nodeRowsByKey[changedNode.nodeKey];
+          if (!originalNodeRow) continue;
+          dedupedRowsByNodeKey[changedNode.nodeKey] = {
+            ...originalNodeRow,
+            key: changedNode.nodeKey,
+            tier: changedNode.tier.toString(),
+            indent: changedNode.indent.toString(),
+          };
+        }
+        // Apply property edits
+        if (data.editedNodes) {
+          for (const editedNode of data.editedNodes) {
+            if (deletedNodeSet.has(editedNode.nodeKey)) continue;
+            const existingRow =
+              dedupedRowsByNodeKey[editedNode.nodeKey] || technologyData.nodeRowsByKey[editedNode.nodeKey];
+            if (!existingRow) continue;
+            const updatedRow: Record<string, string | boolean> = { ...existingRow };
+            if (editedNode.technologyKey !== undefined && editedNode.technologyKey.trim() !== "") {
+              updatedRow.technology_key = editedNode.technologyKey.trim();
             }
-          }
-          for (const changedNode of data.changedNodes) {
-            if (deletedNodeSet.has(changedNode.nodeKey)) continue;
-            const originalNodeRow =
-              technologyData.nodeRowsByKey[changedNode.nodeKey];
-            if (!originalNodeRow) continue;
-            dedupedRowsByNodeKey[changedNode.nodeKey] = {
-              ...originalNodeRow,
-              key: changedNode.nodeKey,
-              tier: changedNode.tier.toString(),
-              indent: changedNode.indent.toString(),
-            };
-          }
-          // Apply property edits
-          if (data.editedNodes) {
-            for (const editedNode of data.editedNodes) {
-              if (deletedNodeSet.has(editedNode.nodeKey)) continue;
-              const existingRow =
-                dedupedRowsByNodeKey[editedNode.nodeKey] ||
-                technologyData.nodeRowsByKey[editedNode.nodeKey];
-              if (!existingRow) continue;
-              const updatedRow: Record<string, string | boolean> = {
-                ...existingRow,
-              };
-              if (
-                editedNode.technologyKey !== undefined &&
-                editedNode.technologyKey.trim() !== ""
-              ) {
-                updatedRow.technology_key = editedNode.technologyKey.trim();
-              }
-              if (editedNode.researchPointsRequired !== undefined) {
-                updatedRow.research_points_required =
-                  editedNode.researchPointsRequired.toString();
-              }
-              if (editedNode.requiredParents !== undefined) {
-                updatedRow.required_parents =
-                  editedNode.requiredParents.toString();
-              }
-              if (editedNode.campaignKey !== undefined) {
-                updatedRow.campaign_key = editedNode.campaignKey ?? "";
-              }
-              if (editedNode.factionKey !== undefined) {
-                updatedRow.faction_key = editedNode.factionKey ?? "";
-              }
-              if (editedNode.pixelOffsetX !== undefined) {
-                updatedRow.pixel_offset_x = editedNode.pixelOffsetX.toString();
-              }
-              if (editedNode.pixelOffsetY !== undefined) {
-                updatedRow.pixel_offset_y = editedNode.pixelOffsetY.toString();
-              }
-              dedupedRowsByNodeKey[editedNode.nodeKey] = updatedRow;
+            if (editedNode.researchPointsRequired !== undefined) {
+              updatedRow.research_points_required = editedNode.researchPointsRequired.toString();
             }
+            if (editedNode.requiredParents !== undefined) {
+              updatedRow.required_parents = editedNode.requiredParents.toString();
+            }
+            if (editedNode.campaignKey !== undefined) {
+              updatedRow.campaign_key = editedNode.campaignKey ?? "";
+            }
+            if (editedNode.factionKey !== undefined) {
+              updatedRow.faction_key = editedNode.factionKey ?? "";
+            }
+            if (editedNode.pixelOffsetX !== undefined) {
+              updatedRow.pixel_offset_x = editedNode.pixelOffsetX.toString();
+            }
+            if (editedNode.pixelOffsetY !== undefined) {
+              updatedRow.pixel_offset_y = editedNode.pixelOffsetY.toString();
+            }
+            dedupedRowsByNodeKey[editedNode.nodeKey] = updatedRow;
           }
-          const rows = Object.values(dedupedRowsByNodeKey).map((row) =>
-            buildRowFromSchema(schema.fields, row),
-          );
-          if (rows.length > 0) {
-            const buffer = await buildDBFileBuffer(
-              schema.version,
-              rows,
-              schema.fields,
+        }
+        const rows = Object.values(dedupedRowsByNodeKey).map((row) => buildRowFromSchema(schema.fields, row));
+        if (rows.length > 0) {
+          const buffer = await buildDBFileBuffer(schema.version, rows, schema.fields);
+          packFiles.push({
+            name: `db\\technology_nodes_tables\\${tableName}`,
+            file_size: buffer.length,
+            buffer,
+          });
+        }
+      }
+      // Handle edited nodes and hidden overrides in one technologies_tables file. Keeping both
+      // sources in the same row map prevents duplicate packed file paths and preserves edits when
+      // a node's hidden state is changed at the same time.
+      if ((hasNodeEdits && data.editedNodes) || data.hiddenTechnologies.length > 0) {
+        const techSchema = getPreferredSchema("technologies_tables");
+        const dedupedRows: Record<string, Record<string, string | boolean>> = {};
+        const hiddenStateByTechnologyKey = new Map<string, boolean>();
+        for (const hiddenTechnology of data.hiddenTechnologies) {
+          const originalRow = technologyData.technologyRowsByKey[hiddenTechnology.technologyKey];
+          if (!originalRow) continue;
+          hiddenStateByTechnologyKey.set(hiddenTechnology.technologyKey, hiddenTechnology.isHidden);
+          dedupedRows[hiddenTechnology.technologyKey] = {
+            ...originalRow,
+            key: hiddenTechnology.technologyKey,
+            is_hidden: hiddenTechnology.isHidden ? "true" : "false",
+            building_level: hiddenTechnology.isHidden ? "wh_main_chs_port_ruin" : originalRow.building_level || "",
+          };
+        }
+        for (const editedNode of data.editedNodes || []) {
+          const nodeRow = technologyData.nodeRowsByKey[editedNode.nodeKey];
+          const technologyKey = (editedNode.technologyKey || (nodeRow?.technology_key as string) || "").trim();
+          if (!technologyKey) continue;
+          const originalTechRow = technologyData.technologyRowsByKey[technologyKey];
+          const sourceTechnologyKey = (nodeRow?.technology_key as string) || "";
+          const sourceTechRowForClone = technologyData.technologyRowsByKey[sourceTechnologyKey];
+          const baseTechRow = dedupedRows[technologyKey] || originalTechRow || sourceTechRowForClone || {};
+          const isBrandNewTechnology = !originalTechRow;
+          const updatedRow: Record<string, string | boolean> = {
+            ...baseTechRow,
+            key: technologyKey,
+          };
+          if (editedNode.researchPointsRequired !== undefined) {
+            updatedRow.research_points_required = editedNode.researchPointsRequired.toString();
+          }
+          if (editedNode.isHidden !== undefined) {
+            updatedRow.is_hidden = editedNode.isHidden ? "true" : "false";
+          }
+          if (editedNode.iconPath !== undefined) {
+            updatedRow.icon_name = getTechnologyIconNameFromPath(editedNode.iconPath || undefined);
+          }
+          if (editedNode.buildingLevel !== undefined) {
+            updatedRow.building_level = getTechnologyBuildingLevelForWrite(
+              editedNode.buildingLevel,
+              originalTechRow || sourceTechRowForClone,
             );
+          }
+          if (isBrandNewTechnology) {
+            updatedRow.unique_index =
+              updatedRow.unique_index || allocateTechnologyUniqueIndex(usedTechnologyUniqueIndexes);
+            updatedRow.is_military = updatedRow.is_military ?? "true";
+          }
+          const hiddenState = editedNode.isHidden ?? hiddenStateByTechnologyKey.get(technologyKey);
+          if (hiddenState !== undefined) {
+            updatedRow.is_hidden = hiddenState ? "true" : "false";
+            if (hiddenState) updatedRow.building_level = "wh_main_chs_port_ruin";
+          }
+          dedupedRows[technologyKey] = updatedRow;
+        }
+        const rows = Object.values(dedupedRows).map((row) => buildRowFromSchema(techSchema.fields, row));
+        if (rows.length > 0) {
+          const buffer = await buildDBFileBuffer(techSchema.version, rows, techSchema.fields);
+          packFiles.push({ name: `db\\technologies_tables\\${tableName}`, file_size: buffer.length, buffer });
+        }
+      }
+      const hasLinkDeletions = data.deletedLinkKeys && data.deletedLinkKeys.length > 0;
+      if (data.changedLinks.length > 0 || hasLinkDeletions) {
+        const schema = getPreferredSchema("technology_node_links_tables");
+        const deletedLinkSet = new Set(data.deletedLinkKeys || []);
+        const dedupedRowsByLinkKey: Record<string, Record<string, string | boolean>> = {};
+        if (hasLinkDeletions) {
+          // Write complete replacement: all original links minus deleted ones
+          for (const [linkKey, originalRow] of Object.entries(technologyData.linkRowsByKey)) {
+            if (deletedLinkSet.has(linkKey)) continue;
+            dedupedRowsByLinkKey[linkKey] = { ...originalRow };
+          }
+        }
+        for (const changedLink of data.changedLinks) {
+          const linkKey = `${changedLink.parentKey}|${changedLink.childKey}`;
+          if (deletedLinkSet.has(linkKey)) continue;
+          const originalRow = technologyData.linkRowsByKey[linkKey] || {};
+          dedupedRowsByLinkKey[linkKey] = {
+            ...originalRow,
+            parent_key: changedLink.parentKey,
+            child_key: changedLink.childKey,
+            parent_link_position: changedLink.parentLinkPosition.toString(),
+            child_link_position: changedLink.childLinkPosition.toString(),
+            parent_link_position_offset: changedLink.parentLinkPositionOffset.toString(),
+            child_link_position_offset: changedLink.childLinkPositionOffset.toString(),
+            initial_descent_tiers: changedLink.initialDescentTiers.toString(),
+            visible_in_ui: changedLink.visibleInUi ? "1" : "0",
+          };
+        }
+        const rows = Object.values(dedupedRowsByLinkKey).map((row) => buildRowFromSchema(schema.fields, row));
+        if (rows.length > 0) {
+          const buffer = await buildDBFileBuffer(schema.version, rows, schema.fields);
+          packFiles.push({
+            name: `db\\technology_node_links_tables\\${tableName}`,
+            file_size: buffer.length,
+            buffer,
+          });
+        }
+      }
+      if (data.newNodes && data.newNodes.length > 0) {
+        // Write new entries to technology_nodes_tables
+        const nodeSchema = getPreferredSchema("technology_nodes_tables");
+        const newNodeRows = data.newNodes.map((newNode) =>
+          buildRowFromSchema(nodeSchema.fields, {
+            key: newNode.nodeKey,
+            technology_key: newNode.technologyKey,
+            technology_node_set: newNode.setKey,
+            tier: newNode.tier.toString(),
+            indent: newNode.indent.toString(),
+            required_parents: newNode.requiredParents.toString(),
+            campaign_key: newNode.campaignKey || "",
+            faction_key: newNode.factionKey || "",
+            optional_ui_group: newNode.optionalUiGroup || "",
+            pixel_offset_x: newNode.pixelOffsetX.toString(),
+            pixel_offset_y: newNode.pixelOffsetY.toString(),
+            research_points_required: newNode.researchPointsRequired.toString(),
+          }),
+        );
+        if (newNodeRows.length > 0) {
+          // Merge with any existing changed node rows for the same table
+          const existingNodeFile = packFiles.find((f) => f.name.startsWith("db\\technology_nodes_tables\\"));
+          if (existingNodeFile) {
+            // Re-build with combined rows: need to re-parse existing buffer rows + new rows
+            // For simplicity, just add a separate table entry
+            const buffer = await buildDBFileBuffer(nodeSchema.version, newNodeRows, nodeSchema.fields);
+            packFiles.push({
+              name: `db\\technology_nodes_tables\\${tableName}_new`,
+              file_size: buffer.length,
+              buffer,
+            });
+          } else {
+            const buffer = await buildDBFileBuffer(nodeSchema.version, newNodeRows, nodeSchema.fields);
             packFiles.push({
               name: `db\\technology_nodes_tables\\${tableName}`,
               file_size: buffer.length,
@@ -13816,105 +14352,37 @@ export const registerIpcMainListeners = (
             });
           }
         }
-        // Handle edited nodes and hidden overrides in one technologies_tables file. Keeping both
-        // sources in the same row map prevents duplicate packed file paths and preserves edits when
-        // a node's hidden state is changed at the same time.
-        if (
-          (hasNodeEdits && data.editedNodes) ||
-          data.hiddenTechnologies.length > 0
-        ) {
-          const techSchema = getPreferredSchema("technologies_tables");
-          const dedupedRows: Record<
-            string,
-            Record<string, string | boolean>
-          > = {};
-          const hiddenStateByTechnologyKey = new Map<string, boolean>();
-          for (const hiddenTechnology of data.hiddenTechnologies) {
-            const originalRow =
-              technologyData.technologyRowsByKey[
-                hiddenTechnology.technologyKey
-              ];
-            if (!originalRow) continue;
-            hiddenStateByTechnologyKey.set(
-              hiddenTechnology.technologyKey,
-              hiddenTechnology.isHidden,
-            );
-            dedupedRows[hiddenTechnology.technologyKey] = {
-              ...originalRow,
-              key: hiddenTechnology.technologyKey,
-              is_hidden: hiddenTechnology.isHidden ? "true" : "false",
-              building_level: hiddenTechnology.isHidden
-                ? "wh_main_chs_port_ruin"
-                : originalRow.building_level || "",
-            };
-          }
-          for (const editedNode of data.editedNodes || []) {
-            const nodeRow = technologyData.nodeRowsByKey[editedNode.nodeKey];
-            const technologyKey = (
-              editedNode.technologyKey ||
-              (nodeRow?.technology_key as string) ||
-              ""
-            ).trim();
-            if (!technologyKey) continue;
-            const originalTechRow =
-              technologyData.technologyRowsByKey[technologyKey];
-            const sourceTechnologyKey =
-              (nodeRow?.technology_key as string) || "";
-            const sourceTechRowForClone =
-              technologyData.technologyRowsByKey[sourceTechnologyKey];
-            const baseTechRow =
-              dedupedRows[technologyKey] ||
-              originalTechRow ||
-              sourceTechRowForClone ||
-              {};
-            const isBrandNewTechnology = !originalTechRow;
-            const updatedRow: Record<string, string | boolean> = {
-              ...baseTechRow,
-              key: technologyKey,
-            };
-            if (editedNode.researchPointsRequired !== undefined) {
-              updatedRow.research_points_required =
-                editedNode.researchPointsRequired.toString();
-            }
-            if (editedNode.isHidden !== undefined) {
-              updatedRow.is_hidden = editedNode.isHidden ? "true" : "false";
-            }
-            if (editedNode.iconPath !== undefined) {
-              updatedRow.icon_name = getTechnologyIconNameFromPath(
-                editedNode.iconPath || undefined,
-              );
-            }
-            if (editedNode.buildingLevel !== undefined) {
-              updatedRow.building_level = getTechnologyBuildingLevelForWrite(
-                editedNode.buildingLevel,
-                originalTechRow || sourceTechRowForClone,
-              );
-            }
-            if (isBrandNewTechnology) {
-              updatedRow.unique_index =
-                updatedRow.unique_index ||
-                allocateTechnologyUniqueIndex(usedTechnologyUniqueIndexes);
-              updatedRow.is_military = updatedRow.is_military ?? "true";
-            }
-            const hiddenState =
-              editedNode.isHidden ??
-              hiddenStateByTechnologyKey.get(technologyKey);
-            if (hiddenState !== undefined) {
-              updatedRow.is_hidden = hiddenState ? "true" : "false";
-              if (hiddenState)
-                updatedRow.building_level = "wh_main_chs_port_ruin";
-            }
-            dedupedRows[technologyKey] = updatedRow;
-          }
-          const rows = Object.values(dedupedRows).map((row) =>
-            buildRowFromSchema(techSchema.fields, row),
+        // Write new entries to technologies_tables
+        const techSchema = getPreferredSchema("technologies_tables");
+        const newTechRowsByKey = new Map<string, (string | boolean)[]>();
+        for (const newNode of data.newNodes) {
+          if (technologyData.technologyRowsByKey[newNode.technologyKey]) continue;
+          if (newTechRowsByKey.has(newNode.technologyKey)) continue;
+          newTechRowsByKey.set(
+            newNode.technologyKey,
+            buildRowFromSchema(techSchema.fields, {
+              key: newNode.technologyKey,
+              research_points_required: newNode.researchPointsRequired.toString(),
+              icon_name: getTechnologyIconNameFromPath(newNode.iconPath),
+              is_hidden: newNode.isHidden ? "true" : "false",
+              building_level: getTechnologyBuildingLevelForWrite(newNode.buildingLevel),
+              unique_index: allocateTechnologyUniqueIndex(usedTechnologyUniqueIndexes),
+              is_military: "true",
+            }),
           );
-          if (rows.length > 0) {
-            const buffer = await buildDBFileBuffer(
-              techSchema.version,
-              rows,
-              techSchema.fields,
-            );
+        }
+        const newTechRows = [...newTechRowsByKey.values()];
+        if (newTechRows.length > 0) {
+          const existingTechFile = packFiles.find((f) => f.name.startsWith("db\\technologies_tables\\"));
+          if (existingTechFile) {
+            const buffer = await buildDBFileBuffer(techSchema.version, newTechRows, techSchema.fields);
+            packFiles.push({
+              name: `db\\technologies_tables\\${tableName}_new`,
+              file_size: buffer.length,
+              buffer,
+            });
+          } else {
+            const buffer = await buildDBFileBuffer(techSchema.version, newTechRows, techSchema.fields);
             packFiles.push({
               name: `db\\technologies_tables\\${tableName}`,
               file_size: buffer.length,
@@ -13922,396 +14390,166 @@ export const registerIpcMainListeners = (
             });
           }
         }
-        const hasLinkDeletions =
-          data.deletedLinkKeys && data.deletedLinkKeys.length > 0;
-        if (data.changedLinks.length > 0 || hasLinkDeletions) {
-          const schema = getPreferredSchema("technology_node_links_tables");
-          const deletedLinkSet = new Set(data.deletedLinkKeys || []);
-          const dedupedRowsByLinkKey: Record<
-            string,
-            Record<string, string | boolean>
-          > = {};
-          if (hasLinkDeletions) {
-            // Write complete replacement: all original links minus deleted ones
-            for (const [linkKey, originalRow] of Object.entries(
-              technologyData.linkRowsByKey,
-            )) {
-              if (deletedLinkSet.has(linkKey)) continue;
-              dedupedRowsByLinkKey[linkKey] = { ...originalRow };
-            }
-          }
-          for (const changedLink of data.changedLinks) {
-            const linkKey = `${changedLink.parentKey}|${changedLink.childKey}`;
-            if (deletedLinkSet.has(linkKey)) continue;
-            const originalRow = technologyData.linkRowsByKey[linkKey] || {};
-            dedupedRowsByLinkKey[linkKey] = {
-              ...originalRow,
-              parent_key: changedLink.parentKey,
-              child_key: changedLink.childKey,
-              parent_link_position: changedLink.parentLinkPosition.toString(),
-              child_link_position: changedLink.childLinkPosition.toString(),
-              parent_link_position_offset:
-                changedLink.parentLinkPositionOffset.toString(),
-              child_link_position_offset:
-                changedLink.childLinkPositionOffset.toString(),
-              initial_descent_tiers: changedLink.initialDescentTiers.toString(),
-              visible_in_ui: changedLink.visibleInUi ? "1" : "0",
-            };
-          }
-          const rows = Object.values(dedupedRowsByLinkKey).map((row) =>
-            buildRowFromSchema(schema.fields, row),
+      }
+      if (data.uiTabToNodes && data.newNodes && data.newNodes.length > 0) {
+        const uiTabsToNodesSchema = getPreferredSchema("technology_ui_tabs_to_technology_nodes_junctions_tables");
+        const newNodeKeys = new Set(data.newNodes.map((newNode) => newNode.nodeKey));
+        const uiTabsToNodesRows = Object.entries(data.uiTabToNodes).flatMap(([tab, nodeKeys]) =>
+          nodeKeys
+            .filter((nodeKey) => newNodeKeys.has(nodeKey))
+            .map((nodeKey) =>
+              buildRowFromSchema(uiTabsToNodesSchema.fields, {
+                tab,
+                node: nodeKey,
+              }),
+            ),
+        );
+        if (uiTabsToNodesRows.length > 0) {
+          const buffer = await buildDBFileBuffer(
+            uiTabsToNodesSchema.version,
+            uiTabsToNodesRows,
+            uiTabsToNodesSchema.fields,
           );
-          if (rows.length > 0) {
-            const buffer = await buildDBFileBuffer(
-              schema.version,
-              rows,
-              schema.fields,
-            );
-            packFiles.push({
-              name: `db\\technology_node_links_tables\\${tableName}`,
-              file_size: buffer.length,
-              buffer,
-            });
-          }
+          packFiles.push({
+            name: `db\\technology_ui_tabs_to_technology_nodes_junctions_tables\\${tableName}`,
+            file_size: buffer.length,
+            buffer,
+          });
         }
-        if (data.newNodes && data.newNodes.length > 0) {
-          // Write new entries to technology_nodes_tables
-          const nodeSchema = getPreferredSchema("technology_nodes_tables");
-          const newNodeRows = data.newNodes.map((newNode) =>
-            buildRowFromSchema(nodeSchema.fields, {
-              key: newNode.nodeKey,
-              technology_key: newNode.technologyKey,
-              technology_node_set: newNode.setKey,
-              tier: newNode.tier.toString(),
-              indent: newNode.indent.toString(),
-              required_parents: newNode.requiredParents.toString(),
-              campaign_key: newNode.campaignKey || "",
-              faction_key: newNode.factionKey || "",
-              optional_ui_group: newNode.optionalUiGroup || "",
-              pixel_offset_x: newNode.pixelOffsetX.toString(),
-              pixel_offset_y: newNode.pixelOffsetY.toString(),
-              research_points_required:
-                newNode.researchPointsRequired.toString(),
+      }
+      const techEffectsSchema = getPreferredSchema("technology_effects_junction_tables");
+      const techEffectsRows: (string | boolean)[][] = [];
+      const seenTechnologyEffects = new Set<string>();
+      let defaultTechnologyEffectScopeFallbackCount = 0;
+      const pushTechnologyEffects = (
+        technologyKey: string,
+        effects: TechEffect[] | undefined,
+        sourceTechnologyKey?: string,
+      ) => {
+        if (!effects || effects.length < 1) return;
+        for (const effect of effects) {
+          const effectKey = `${effect.effectKey || ""}`.trim();
+          if (!effectKey) continue;
+          const rowKey = `${technologyKey}|${effectKey}`;
+          if (seenTechnologyEffects.has(rowKey)) continue;
+          seenTechnologyEffects.add(rowKey);
+          const resolvedEffectScope =
+            (sourceTechnologyKey
+              ? technologyData.technologyEffectRowsByKey[sourceTechnologyKey]?.[effectKey]?.effect_scope
+              : undefined) ||
+            technologyData.technologyEffectScopesByKey[effectKey] ||
+            "default";
+          if (resolvedEffectScope === "default") {
+            defaultTechnologyEffectScopeFallbackCount += 1;
+          }
+          techEffectsRows.push(
+            buildRowFromSchema(techEffectsSchema.fields, {
+              ...(sourceTechnologyKey
+                ? technologyData.technologyEffectRowsByKey[sourceTechnologyKey]?.[effectKey] || {}
+                : {}),
+              technology: technologyKey,
+              effect: effectKey,
+              effect_scope: resolvedEffectScope,
+              value: effect.value || "",
             }),
           );
-          if (newNodeRows.length > 0) {
-            // Merge with any existing changed node rows for the same table
-            const existingNodeFile = packFiles.find((f) =>
-              f.name.startsWith("db\\technology_nodes_tables\\"),
-            );
-            if (existingNodeFile) {
-              // Re-build with combined rows: need to re-parse existing buffer rows + new rows
-              // For simplicity, just add a separate table entry
-              const buffer = await buildDBFileBuffer(
-                nodeSchema.version,
-                newNodeRows,
-                nodeSchema.fields,
-              );
-              packFiles.push({
-                name: `db\\technology_nodes_tables\\${tableName}_new`,
-                file_size: buffer.length,
-                buffer,
-              });
-            } else {
-              const buffer = await buildDBFileBuffer(
-                nodeSchema.version,
-                newNodeRows,
-                nodeSchema.fields,
-              );
-              packFiles.push({
-                name: `db\\technology_nodes_tables\\${tableName}`,
-                file_size: buffer.length,
-                buffer,
-              });
-            }
-          }
-          // Write new entries to technologies_tables
-          const techSchema = getPreferredSchema("technologies_tables");
-          const newTechRowsByKey = new Map<string, (string | boolean)[]>();
-          for (const newNode of data.newNodes) {
-            if (technologyData.technologyRowsByKey[newNode.technologyKey])
-              continue;
-            if (newTechRowsByKey.has(newNode.technologyKey)) continue;
-            newTechRowsByKey.set(
-              newNode.technologyKey,
-              buildRowFromSchema(techSchema.fields, {
-                key: newNode.technologyKey,
-                research_points_required:
-                  newNode.researchPointsRequired.toString(),
-                icon_name: getTechnologyIconNameFromPath(newNode.iconPath),
-                is_hidden: newNode.isHidden ? "true" : "false",
-                building_level: getTechnologyBuildingLevelForWrite(
-                  newNode.buildingLevel,
-                ),
-                unique_index: allocateTechnologyUniqueIndex(
-                  usedTechnologyUniqueIndexes,
-                ),
-                is_military: "true",
-              }),
-            );
-          }
-          const newTechRows = [...newTechRowsByKey.values()];
-          if (newTechRows.length > 0) {
-            const existingTechFile = packFiles.find((f) =>
-              f.name.startsWith("db\\technologies_tables\\"),
-            );
-            if (existingTechFile) {
-              const buffer = await buildDBFileBuffer(
-                techSchema.version,
-                newTechRows,
-                techSchema.fields,
-              );
-              packFiles.push({
-                name: `db\\technologies_tables\\${tableName}_new`,
-                file_size: buffer.length,
-                buffer,
-              });
-            } else {
-              const buffer = await buildDBFileBuffer(
-                techSchema.version,
-                newTechRows,
-                techSchema.fields,
-              );
-              packFiles.push({
-                name: `db\\technologies_tables\\${tableName}`,
-                file_size: buffer.length,
-                buffer,
-              });
-            }
-          }
         }
-        if (data.uiTabToNodes && data.newNodes && data.newNodes.length > 0) {
-          const uiTabsToNodesSchema = getPreferredSchema(
-            "technology_ui_tabs_to_technology_nodes_junctions_tables",
-          );
-          const newNodeKeys = new Set(
-            data.newNodes.map((newNode) => newNode.nodeKey),
-          );
-          const uiTabsToNodesRows = Object.entries(data.uiTabToNodes).flatMap(
-            ([tab, nodeKeys]) =>
-              nodeKeys
-                .filter((nodeKey) => newNodeKeys.has(nodeKey))
-                .map((nodeKey) =>
-                  buildRowFromSchema(uiTabsToNodesSchema.fields, {
-                    tab,
-                    node: nodeKey,
-                  }),
-                ),
-          );
-          if (uiTabsToNodesRows.length > 0) {
-            const buffer = await buildDBFileBuffer(
-              uiTabsToNodesSchema.version,
-              uiTabsToNodesRows,
-              uiTabsToNodesSchema.fields,
-            );
-            packFiles.push({
-              name: `db\\technology_ui_tabs_to_technology_nodes_junctions_tables\\${tableName}`,
-              file_size: buffer.length,
-              buffer,
-            });
-          }
+      };
+      if (data.newNodes) {
+        for (const newNode of data.newNodes) {
+          if (technologyData.technologyRowsByKey[newNode.technologyKey]) continue;
+          pushTechnologyEffects(newNode.technologyKey, newNode.effects);
         }
-        const techEffectsSchema = getPreferredSchema(
-          "technology_effects_junction_tables",
-        );
-        const techEffectsRows: (string | boolean)[][] = [];
-        const seenTechnologyEffects = new Set<string>();
-        let defaultTechnologyEffectScopeFallbackCount = 0;
-        const pushTechnologyEffects = (
-          technologyKey: string,
-          effects: TechEffect[] | undefined,
-          sourceTechnologyKey?: string,
-        ) => {
-          if (!effects || effects.length < 1) return;
-          for (const effect of effects) {
-            const effectKey = `${effect.effectKey || ""}`.trim();
-            if (!effectKey) continue;
-            const rowKey = `${technologyKey}|${effectKey}`;
-            if (seenTechnologyEffects.has(rowKey)) continue;
-            seenTechnologyEffects.add(rowKey);
-            const resolvedEffectScope =
-              (sourceTechnologyKey
-                ? technologyData.technologyEffectRowsByKey[
-                    sourceTechnologyKey
-                  ]?.[effectKey]?.effect_scope
-                : undefined) ||
-              technologyData.technologyEffectScopesByKey[effectKey] ||
-              "default";
-            if (resolvedEffectScope === "default") {
-              defaultTechnologyEffectScopeFallbackCount += 1;
-            }
-            techEffectsRows.push(
-              buildRowFromSchema(techEffectsSchema.fields, {
-                ...(sourceTechnologyKey
-                  ? technologyData.technologyEffectRowsByKey[
-                      sourceTechnologyKey
-                    ]?.[effectKey] || {}
-                  : {}),
-                technology: technologyKey,
-                effect: effectKey,
-                effect_scope: resolvedEffectScope,
-                value: effect.value || "",
-              }),
-            );
-          }
-        };
-        if (data.newNodes) {
-          for (const newNode of data.newNodes) {
-            if (technologyData.technologyRowsByKey[newNode.technologyKey])
-              continue;
-            pushTechnologyEffects(newNode.technologyKey, newNode.effects);
-          }
-        }
-        if (data.editedNodes) {
-          for (const editedNode of data.editedNodes) {
-            const nodeRow = technologyData.nodeRowsByKey[editedNode.nodeKey];
-            const technologyKey = (
-              editedNode.technologyKey ||
-              (nodeRow?.technology_key as string) ||
-              ""
-            ).trim();
-            if (!technologyKey) continue;
-            if (technologyData.technologyRowsByKey[technologyKey]) continue;
-            pushTechnologyEffects(
-              technologyKey,
-              editedNode.effects,
-              nodeRow?.technology_key as string | undefined,
-            );
-          }
-        }
-        if (techEffectsRows.length > 0) {
-          const buffer = await buildDBFileBuffer(
-            techEffectsSchema.version,
-            techEffectsRows,
-            techEffectsSchema.fields,
-          );
-          packFiles.push({
-            name: `db\\technology_effects_junction_tables\\${tableName}`,
-            file_size: buffer.length,
-            buffer,
-          });
-        }
-        // Write loc entries for new and edited node names/descriptions
-        const locRows: (string | boolean)[][] = [];
-        if (data.newNodes) {
-          for (const newNode of data.newNodes) {
-            if (technologyData.technologyRowsByKey[newNode.technologyKey])
-              continue;
-            if (newNode.displayName) {
-              locRows.push([
-                `technologies_onscreen_name_${newNode.technologyKey}`,
-                newNode.displayName,
-                false,
-              ]);
-            }
-            if (newNode.shortDescription) {
-              locRows.push([
-                `technologies_short_description_${newNode.technologyKey}`,
-                newNode.shortDescription,
-                false,
-              ]);
-            }
-            if (newNode.longDescription) {
-              locRows.push([
-                `technologies_long_description_${newNode.technologyKey}`,
-                newNode.longDescription,
-                false,
-              ]);
-            }
-          }
-        }
-        if (data.editedNodes) {
-          for (const editedNode of data.editedNodes) {
-            const nodeRow = technologyData.nodeRowsByKey[editedNode.nodeKey];
-            const technologyKey = (
-              editedNode.technologyKey ||
-              (nodeRow?.technology_key as string) ||
-              ""
-            ).trim();
-            if (!technologyKey) continue;
-            if (editedNode.displayName !== undefined) {
-              locRows.push([
-                `technologies_onscreen_name_${technologyKey}`,
-                editedNode.displayName,
-                false,
-              ]);
-            }
-            if (editedNode.shortDescription !== undefined) {
-              locRows.push([
-                `technologies_short_description_${technologyKey}`,
-                editedNode.shortDescription || "",
-                false,
-              ]);
-            }
-            if (editedNode.longDescription !== undefined) {
-              locRows.push([
-                `technologies_long_description_${technologyKey}`,
-                editedNode.longDescription || "",
-                false,
-              ]);
-            }
-          }
-        }
-        if (locRows.length > 0) {
-          const buildLocFileBuffer = async (
-            rows: (string | boolean)[][],
-          ): Promise<Buffer> => {
-            const parts: Buffer[] = [];
-            parts.push(Buffer.from([0xff, 0xfe]));
-            parts.push(Buffer.from([0x4c, 0x4f, 0x43]));
-            parts.push(Buffer.from([0x00]));
-            const cBuf = Buffer.alloc(4);
-            cBuf.writeInt32LE(1, 0);
-            parts.push(cBuf);
-            const countBuf = Buffer.alloc(4);
-            countBuf.writeInt32LE(rows.length, 0);
-            parts.push(countBuf);
-            for (const row of rows) {
-              for (let i = 0; i < LocFields.length; i++) {
-                parts.push(await typeToBuffer(LocFields[i].field_type, row[i]));
-              }
-            }
-            return Buffer.concat(parts);
-          };
-          const buffer = await buildLocFileBuffer(locRows);
-          packFiles.push({
-            name: `text\\db\\${tableName}.loc`,
-            file_size: buffer.length,
-            buffer,
-          });
-        }
-        if (packFiles.length < 1)
-          return { success: false, error: "No technology changes detected" };
-        await writePack(packFiles, packPath);
-        cachedTechnologyData = undefined;
-        cachedTechnologyDataKey = undefined;
-        return {
-          success: true,
-          packPath,
-          packName: finalPackName,
-          warning:
-            defaultTechnologyEffectScopeFallbackCount > 0
-              ? `${defaultTechnologyEffectScopeFallbackCount} technology effect row${defaultTechnologyEffectScopeFallbackCount === 1 ? "" : "s"} used fallback effect_scope 'default'.`
-              : undefined,
-        };
-      } catch (error: any) {
-        console.error("Failed to save technology changes:", error);
-        return { success: false, error: error?.message || String(error) };
       }
-    },
-  );
-  ipcMain.on(
-    "getPackData",
-    async (event, packPath: string, table?: DBTable) => {
-      getPackData(packPath, table);
-    },
-  );
-  ipcMain.on(
-    "getPackDataWithLocs",
-    async (event, packPath: string, table?: DBTable) => {
-      getPackData(packPath, table, true);
-    },
-  );
+      if (data.editedNodes) {
+        for (const editedNode of data.editedNodes) {
+          const nodeRow = technologyData.nodeRowsByKey[editedNode.nodeKey];
+          const technologyKey = (editedNode.technologyKey || (nodeRow?.technology_key as string) || "").trim();
+          if (!technologyKey) continue;
+          if (technologyData.technologyRowsByKey[technologyKey]) continue;
+          pushTechnologyEffects(technologyKey, editedNode.effects, nodeRow?.technology_key as string | undefined);
+        }
+      }
+      if (techEffectsRows.length > 0) {
+        const buffer = await buildDBFileBuffer(techEffectsSchema.version, techEffectsRows, techEffectsSchema.fields);
+        packFiles.push({
+          name: `db\\technology_effects_junction_tables\\${tableName}`,
+          file_size: buffer.length,
+          buffer,
+        });
+      }
+      // Write loc entries for new and edited node names/descriptions
+      const locRows: (string | boolean)[][] = [];
+      if (data.newNodes) {
+        for (const newNode of data.newNodes) {
+          if (technologyData.technologyRowsByKey[newNode.technologyKey]) continue;
+          if (newNode.displayName) {
+            locRows.push([`technologies_onscreen_name_${newNode.technologyKey}`, newNode.displayName, false]);
+          }
+          if (newNode.shortDescription) {
+            locRows.push([`technologies_short_description_${newNode.technologyKey}`, newNode.shortDescription, false]);
+          }
+          if (newNode.longDescription) {
+            locRows.push([`technologies_long_description_${newNode.technologyKey}`, newNode.longDescription, false]);
+          }
+        }
+      }
+      if (data.editedNodes) {
+        for (const editedNode of data.editedNodes) {
+          const nodeRow = technologyData.nodeRowsByKey[editedNode.nodeKey];
+          const technologyKey = (editedNode.technologyKey || (nodeRow?.technology_key as string) || "").trim();
+          if (!technologyKey) continue;
+          if (editedNode.displayName !== undefined) {
+            locRows.push([`technologies_onscreen_name_${technologyKey}`, editedNode.displayName, false]);
+          }
+          if (editedNode.shortDescription !== undefined) {
+            locRows.push([`technologies_short_description_${technologyKey}`, editedNode.shortDescription || "", false]);
+          }
+          if (editedNode.longDescription !== undefined) {
+            locRows.push([`technologies_long_description_${technologyKey}`, editedNode.longDescription || "", false]);
+          }
+        }
+      }
+      if (locRows.length > 0) {
+        const buildLocFileBuffer = async (rows: (string | boolean)[][]): Promise<Buffer> => {
+          const parts: Buffer[] = [];
+          parts.push(Buffer.from([0xff, 0xfe]));
+          parts.push(Buffer.from([0x4c, 0x4f, 0x43]));
+          parts.push(Buffer.from([0x00]));
+          const cBuf = Buffer.alloc(4);
+          cBuf.writeInt32LE(1, 0);
+          parts.push(cBuf);
+          const countBuf = Buffer.alloc(4);
+          countBuf.writeInt32LE(rows.length, 0);
+          parts.push(countBuf);
+          for (const row of rows) {
+            for (let i = 0; i < LocFields.length; i++) {
+              parts.push(await typeToBuffer(LocFields[i].field_type, row[i]));
+            }
+          }
+          return Buffer.concat(parts);
+        };
+        const buffer = await buildLocFileBuffer(locRows);
+        packFiles.push({ name: `text\\db\\${tableName}.loc`, file_size: buffer.length, buffer });
+      }
+      if (packFiles.length < 1) return { success: false, error: "No technology changes detected" };
+      await writePack(packFiles, packPath);
+      cachedTechnologyData = undefined;
+      cachedTechnologyDataKey = undefined;
+      return {
+        success: true,
+        packPath,
+        packName: finalPackName,
+        warning:
+          defaultTechnologyEffectScopeFallbackCount > 0
+            ? `${defaultTechnologyEffectScopeFallbackCount} technology effect row${defaultTechnologyEffectScopeFallbackCount === 1 ? "" : "s"} used fallback effect_scope 'default'.`
+            : undefined,
+      };
+    } catch (error: any) {
+      console.error("Failed to save technology changes:", error);
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
   const getLiveViewerWindow = () => {
     if (!windows.viewerWindow) return undefined;
     if (windows.viewerWindow.isDestroyed()) {
@@ -14389,8 +14627,7 @@ export const registerIpcMainListeners = (
       appData.openViewerPackPaths.length - 1,
     );
     viewerWindow.setTitle(
-      `WH3 Mod Manager v${version}: viewing ${nodePath.basename(activePackPath)}` +
-        (additionalPackCount > 0 ? ` (+${additionalPackCount} more)` : ""),
+      `${nodePath.basename(activePackPath)}` + (additionalPackCount > 0 ? ` (+${additionalPackCount} more)` : ""),
     );
   };
   const createSkillsWindow = () => {
@@ -14468,6 +14705,15 @@ export const registerIpcMainListeners = (
       windows.techTreesWindow = undefined;
     });
   };
+  const updateRecentPackPaths = (packPath: string) => {
+    const knownVanillaPackNames = [...vanillaPackNames, ...appData.allVanillaPackNames];
+    const nextRecentPackPaths = addRecentPackPath(appData.recentPackPaths, packPath, knownVanillaPackNames);
+    if (recentPackPathsEqual(appData.recentPackPaths, nextRecentPackPaths)) return;
+
+    appData.recentPackPaths = nextRecentPackPaths;
+    mainWindow?.webContents.send("setRecentPackPaths", nextRecentPackPaths);
+    windows.viewerWindow?.webContents.send("setRecentPackPaths", nextRecentPackPaths);
+  };
   const openModInViewerWindow = (modPath: string) => {
     for (const vanillaPackData of gameToVanillaPacksData[appData.currentGame]) {
       const baseVanillaPackName = vanillaPackData.name;
@@ -14479,13 +14725,14 @@ export const registerIpcMainListeners = (
         );
       }
     }
+    updateRecentPackPaths(modPath);
     console.log("ON requestOpenModInViewer", modPath);
     if (!appData.openViewerPackPaths.includes(modPath)) {
       appData.openViewerPackPaths.push(modPath);
       // Runs before the window exists on a cold start, so sendPackViewData can find no viewer to send
       // or queue to. The viewerIsReady replay below re-requests every open pack, which is what covers
       // that case - do not drop it.
-      getPackData(modPath);
+      getPackData(modPath, undefined, undefined, "viewer");
     }
     appData.activeViewerPackPath = modPath;
     let viewerWindow = getLiveViewerWindow();
@@ -14670,17 +14917,29 @@ export const registerIpcMainListeners = (
     return getDBPackedFilePath(dbTable as DBTableSelection);
   };
   const viewerTableRequests = createInFlightTableRequests();
-  const sendPackViewData = (packViewData: PackViewData | undefined) => {
+  const resolveVanillaViewerFilePackPath = async (packPath: string, fileName: string): Promise<string> => {
+    if (!canUseVanillaDbCacheForPack(packPath)) return packPath;
+
+    const vanillaIndex = await getVanillaPackIndex();
+    const dataFolder = appData.gamesToGameFolderPaths[appData.currentGame]?.dataFolder;
+    const vanillaPackName = vanillaIndex ? findVanillaPackContaining(vanillaIndex, fileName) : undefined;
+    return dataFolder && vanillaPackName ? nodePath.join(dataFolder, vanillaPackName) : packPath;
+  };
+  type PackDataDestination = "main" | "viewer";
+  const sendPackViewData = (packViewData: PackViewData | undefined, destination: PackDataDestination) => {
     if (!packViewData) return;
-    const toSend = [packViewData];
+    if (destination === "main") {
+      mainWindow?.webContents.send("setPacksData", [packViewData]);
+      return;
+    }
+
     const viewerWindow = getLiveViewerWindow();
-    mainWindow?.webContents.send("setPacksData", toSend);
-    viewerWindow?.webContents.send("setPacksData", toSend);
-    // Main-window consumers also request pack data. Queue it only when a viewer window actually
-    // exists and is still starting; otherwise a future viewer would receive an unrelated stale pack.
-    if (viewerWindow && !appData.isViewerReady) {
+    if (!viewerWindow) return;
+
+    viewerWindow.webContents.send("setPacksData", [packViewData]);
+    if (!appData.isViewerReady) {
       console.log("VIEWER NOT READY, QUEUEING");
-      appData.queuedViewerData = toSend;
+      appData.queuedViewerData = [packViewData];
     }
   };
 
@@ -14711,6 +14970,7 @@ export const registerIpcMainListeners = (
     packPath: string,
     table?: DBTable,
     getLocs?: boolean,
+    destination: PackDataDestination = "viewer",
   ) => {
     console.log(`getPackData ${packPath}`);
     // A loc is parsed by the loc reader, not the db one, so asking for it has to turn that on.
@@ -14728,7 +14988,7 @@ export const registerIpcMainListeners = (
           console.log("WAIT FOR DATAFOLDER TO BE SET");
           await new Promise((resolve) => setTimeout(resolve, 1000));
           console.log("DONE WAITING FOR DATAFOLDER");
-          getPackData(packPath, table, getLocs);
+          getPackData(packPath, table, getLocs, destination);
           return;
         }
         if (packPath == baseVanillaPackName) {
@@ -14744,22 +15004,18 @@ export const registerIpcMainListeners = (
         console.log("WAIT FOR DATAFOLDER TO BE SET");
         await new Promise((resolve) => setTimeout(resolve, 1000));
         console.log("DONE WAITING FOR DATAFOLDER");
-        getPackData(packPath, table, getLocs);
+        getPackData(packPath, table, getLocs, destination);
         return;
       }
       packPath = nodePath.join(dataFolder as string, packPath);
     }
     const packedFilePath = table ? dbTableToString(table) : "";
-    const requestKey = JSON.stringify([
-      packPath,
-      packedFilePath,
-      Boolean(getLocs),
-    ]);
+    const requestKey = JSON.stringify([destination, packPath, packedFilePath, Boolean(getLocs)]);
     await viewerTableRequests.run(requestKey, async () => {
       const packData = appData.packsData.find((pack) => pack.path === packPath);
 
       if (packData && !table) {
-        sendPackViewData(getPackViewData(packData, undefined, getLocs));
+        sendPackViewData(getPackViewData(packData, undefined, getLocs), destination);
         return;
       }
 
@@ -14768,7 +15024,7 @@ export const registerIpcMainListeners = (
       if (packData && table && !getLocs) {
         const loaded = getLoadedPackViewData(packData, table);
         if (loaded) {
-          sendPackViewData(loaded);
+          sendPackViewData(loaded, destination);
           return;
         }
       }
@@ -14818,9 +15074,87 @@ export const registerIpcMainListeners = (
         console.log("APPENDING packsData", packPath);
         appendPacksData(newPack);
       }
-      sendPackViewData(getPackViewData(newPack, table, getLocs));
+      sendPackViewData(getPackViewData(newPack, table, getLocs), destination);
     });
   };
+  const getPackDataDestination = (sender: Electron.WebContents): PackDataDestination =>
+    getLiveViewerWindow()?.webContents === sender ? "viewer" : "main";
+  const VANILLA_FILE_SEARCH_MAX_RESULTS = 1000;
+
+  ipcMain.on("getPackData", (event, packPath: string, table?: DBTable) => {
+    getPackData(packPath, table, undefined, getPackDataDestination(event.sender));
+  });
+  ipcMain.on("getPackDataWithLocs", (event, packPath: string, table?: DBTable) => {
+    getPackData(packPath, table, true, getPackDataDestination(event.sender));
+  });
+  ipcMain.handle(
+    "getVanillaPackFileTree",
+    async (
+      _event,
+      packPath: string,
+      prefix: string,
+    ): Promise<{ success: boolean; children?: { path: string; isBranch: boolean }[]; error?: string }> => {
+      try {
+        if (!canUseVanillaDbCacheForPack(packPath)) return { success: false, error: "Not the current DB pack" };
+
+        const vanillaIndex = await getVanillaPackIndex();
+        if (!vanillaIndex) return { success: true, children: [] };
+
+        return {
+          success: true,
+          children: collectVanillaPackTreeChildren(
+            vanillaIndex,
+            prefix,
+            (filePath) => parseDBTablePath(filePath) == undefined,
+            (folderPath) => folderPath !== "db" && folderPath !== "unusedtables",
+          ),
+        };
+      } catch (error) {
+        console.error("Could not load vanilla pack file tree:", error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Could not load vanilla pack file tree",
+        };
+      }
+    },
+  );
+  ipcMain.handle(
+    "searchVanillaPackFiles",
+    async (
+      _event,
+      packPath: string,
+      query: string,
+    ): Promise<{
+      success: boolean;
+      filePaths?: string[];
+      folderPaths?: string[];
+      truncated?: boolean;
+      error?: string;
+    }> => {
+      try {
+        if (!canUseVanillaDbCacheForPack(packPath)) return { success: false, error: "Not the current DB pack" };
+
+        const vanillaIndex = await getVanillaPackIndex();
+        if (!vanillaIndex) return { success: true, filePaths: [], folderPaths: [], truncated: false };
+
+        return {
+          success: true,
+          ...searchVanillaPackFileTree(
+            vanillaIndex,
+            query,
+            VANILLA_FILE_SEARCH_MAX_RESULTS,
+            (filePath) => parseDBTablePath(filePath) == undefined,
+          ),
+        };
+      } catch (error) {
+        console.error("Could not search vanilla pack files:", error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Could not search vanilla pack files",
+        };
+      }
+    },
+  );
   const readMods = async (
     mods: Mod[],
     skipParsingTables = true,
@@ -14934,7 +15268,7 @@ export const registerIpcMainListeners = (
       ),
     ];
     for (const packPath of packPathsInSendOrder) {
-      if (!skipReadFor?.has(packPath)) getPackData(packPath);
+      if (!skipReadFor?.has(packPath)) getPackData(packPath, undefined, undefined, "viewer");
       windows.viewerWindow?.webContents.send("openModInViewer", packPath);
       windows.viewerWindow?.webContents.send(
         "setUnsavedPacksData",
@@ -14996,18 +15330,10 @@ export const registerIpcMainListeners = (
       gameToReferences[appData.currentGame],
     );
     windows.viewerWindow?.webContents.send("setStartArgs", appData.startArgs);
-    windows.viewerWindow?.webContents.send(
-      "setCurrentLanguage",
-      appData.currentLanguage,
-    );
-    windows.viewerWindow?.webContents.send(
-      "setIsFeaturesForModdersEnabled",
-      appData.isFeaturesForModdersEnabled,
-    );
-    windows.viewerWindow?.webContents.send(
-      "setModdersPrefix",
-      appData.moddersPrefix,
-    );
+    windows.viewerWindow?.webContents.send("setCurrentLanguage", appData.currentLanguage);
+    windows.viewerWindow?.webContents.send("setIsFeaturesForModdersEnabled", appData.isFeaturesForModdersEnabled);
+    windows.viewerWindow?.webContents.send("setModdersPrefix", appData.moddersPrefix);
+    windows.viewerWindow?.webContents.send("setRecentPackPaths", appData.recentPackPaths);
     // console.log("QUEUED DATA IS ", queuedViewerData);
     if (appData.queuedViewerData.length > 0) {
       sendQueuedDataToViewer();
@@ -15199,6 +15525,21 @@ export const registerIpcMainListeners = (
     const destPath = nodePath.join(dataFolder, baseName);
     fs.copyFileSync(path, destPath);
   });
+  ipcMain.removeHandler("compareModsByteForByte");
+  ipcMain.handle(
+    "compareModsByteForByte",
+    async (
+      _event,
+      modPath: string,
+      workshopModPath: string,
+    ): Promise<{ success: boolean; identical?: boolean; error?: string }> => {
+      try {
+        return { success: true, identical: await compareFilesByteForByte(modPath, workshopModPath) };
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  );
   const checkIsModThumbnailValid = (modThumbnailPath: string) => {
     if (modThumbnailPath == "" || !fs.existsSync(modThumbnailPath)) {
       mainWindow?.webContents.send("addToast", {
@@ -15220,46 +15561,36 @@ export const registerIpcMainListeners = (
   };
   ipcMain.on("uploadMod", async (event, mod: Mod) => {
     if (!checkIsModThumbnailValid(mod.imgPath)) return;
-    const child = fork(
-      nodePath.join(__dirname, "sub.js"),
-      [gameToSteamId[appData.currentGame], "upload"],
-      {},
-    );
-    child.on(
-      "message",
-      (response: ModUploadResponseError | ModUploadResponseSuccess) => {
-        console.log("upload response:", response);
-        if (response && "type" in response) {
-          switch (response.type) {
-            case "success":
+    const child = fork(nodePath.join(__dirname, "sub.js"), [gameToSteamId[appData.currentGame], "upload"], {});
+    child.on("message", (response: ModUploadResponseError | ModUploadResponseSuccess) => {
+      console.log("upload response:", response);
+      if (response && "type" in response) {
+        switch (response.type) {
+          case "success":
+            mainWindow?.webContents.send("addToast", {
+              type: "success",
+              messages: ["loc:modCreated"],
+              startTime: Date.now(),
+            } as Toast);
+            if ("needsToAcceptAgreement" in response && response.needsToAcceptAgreement) {
               mainWindow?.webContents.send("addToast", {
-                type: "success",
-                messages: ["loc:modCreated"],
+                type: "info",
+                messages: ["loc:needsToAcceptSteamWorkshopAgreement"],
                 startTime: Date.now(),
               } as Toast);
-              if (
-                "needsToAcceptAgreement" in response &&
-                response.needsToAcceptAgreement
-              ) {
-                mainWindow?.webContents.send("addToast", {
-                  type: "info",
-                  messages: ["loc:needsToAcceptSteamWorkshopAgreement"],
-                  startTime: Date.now(),
-                } as Toast);
-              }
-              updateMod(mod, response.workshopId, mod.tags, mod.name, true);
-              break;
-            case "error":
-              mainWindow?.webContents.send("addToast", {
-                type: "warning",
-                messages: ["loc:failedUploadingMod"],
-                startTime: Date.now(),
-              } as Toast);
-              break;
-          }
+            }
+            void updateMod(mod, response.workshopId, mod.tags, mod.name, true);
+            break;
+          case "error":
+            mainWindow?.webContents.send("addToast", {
+              type: "warning",
+              messages: ["loc:failedUploadingMod"],
+              startTime: Date.now(),
+            } as Toast);
+            break;
         }
-      },
-    );
+      }
+    });
   });
   const updateMod = async (
     mod: Mod,
@@ -15268,12 +15599,30 @@ export const registerIpcMainListeners = (
     modTitle?: string,
     openInSteamAfterUpdate = false,
   ) => {
-    const uploadFolderName = workshopId;
-    const uploadFolderPath = nodePath.join(
-      nodePath.dirname(mod.path),
-      "whmm_uploads_" + uploadFolderName,
-    );
     if (!checkIsModThumbnailValid(mod.imgPath)) return;
+
+    if (appData.compressModsOnUpload && appData.currentGame === "wh3") {
+      const compressionResponse = await compressPackWithAnalysis(mod.path, appData.isRigidModelV2CompressionEnabled, {
+        allowNoEligible: true,
+      });
+      if (!compressionResponse.success) {
+        const message = i18n.t("compressModsOnUploadFailed", {
+          mod: mod.name,
+          error: compressionResponse.error || "Unknown compression error.",
+        });
+        console.error(message);
+        mainWindow?.webContents.send("handleLog", message);
+        mainWindow?.webContents.send("addToast", {
+          type: "warning",
+          messages: [message],
+          startTime: Date.now(),
+        } as Toast);
+        return;
+      }
+    }
+
+    const uploadFolderName = workshopId;
+    const uploadFolderPath = nodePath.join(nodePath.dirname(mod.path), "whmm_uploads_" + uploadFolderName);
     await fs.rmSync(uploadFolderPath, { recursive: true, force: true });
     await fs.mkdirSync(uploadFolderPath, { recursive: true });
     await fs.linkSync(mod.path, nodePath.join(uploadFolderPath, mod.name));
@@ -15366,7 +15715,7 @@ export const registerIpcMainListeners = (
     );
   };
   ipcMain.on("updateMod", async (event, mod: Mod, contentMod: Mod) => {
-    updateMod(mod, contentMod.workshopId, contentMod.tags);
+    void updateMod(mod, contentMod.workshopId, contentMod.tags);
   });
   ipcMain.on("fakeUpdatePack", async (event, mod: Mod) => {
     try {
@@ -16217,6 +16566,22 @@ export const registerIpcMainListeners = (
   ipcMain.handle("getDataFolder", async (event) => {
     return appData.gamesToGameFolderPaths[appData.currentGame]?.dataFolder;
   });
+  const getRealDataPackNames = async (dataFolder: string): Promise<Set<string>> => {
+    const names = new Set(appData.allMods.filter((mod) => mod.isInData).map((mod) => mod.name.toLowerCase()));
+    const collectPackNames = async (folderPath: string) => {
+      try {
+        const entries = await fs.promises.readdir(folderPath, { withFileTypes: true });
+        entries
+          .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.toLowerCase().endsWith(".pack"))
+          .forEach((entry) => names.add(entry.name.toLowerCase()));
+      } catch {
+        // The configured Data folder is normally present, but a missing optional modding folder is valid.
+      }
+    };
+    await collectPackNames(dataFolder);
+    await collectPackNames(nodePath.join(dataFolder, "modding"));
+    return names;
+  };
   ipcMain.on(
     "startGame",
     async (
@@ -16225,7 +16590,52 @@ export const registerIpcMainListeners = (
       areModsPresorted: boolean,
       startGameOptions: StartGameOptions,
       saveName?: string,
+      requestedRunId?: string,
     ) => {
+      const requestedWorkshopStaging =
+        startGameOptions?.workshopModStagingMode === "copy" || startGameOptions?.workshopModStagingMode === "symlink";
+      const runId = requestedWorkshopStaging
+        ? typeof requestedRunId === "string" && requestedRunId.trim().length > 0 && requestedRunId.length <= 128
+          ? requestedRunId
+          : randomUUID()
+        : undefined;
+
+      if (requestedWorkshopStaging && activeWorkshopStagingRun) {
+        sendWorkshopStagingProgress(event.sender, {
+          runId: runId || randomUUID(),
+          status: "failed",
+          stage: "preparing",
+          completedMods: 0,
+          totalMods: 0,
+          detail: "Another Workshop mod staging launch is already in progress.",
+          error: "alreadyRunning",
+        });
+        return;
+      }
+
+      const workshopStagingRun: ActiveWorkshopStagingRun | undefined = runId
+        ? {
+            runId,
+            senderId: event.sender.id,
+            controller: new AbortController(),
+            canceled: false,
+            lastProgress: { phase: "planning", current: 0, total: 0 },
+          }
+        : undefined;
+      if (workshopStagingRun) {
+        activeWorkshopStagingRun = workshopStagingRun;
+        sendWorkshopStagingProgress(event.sender, {
+          runId: workshopStagingRun.runId,
+          status: "running",
+          stage: "preparing",
+          completedMods: 0,
+          totalMods: 0,
+          detail: "Preparing Workshop mods…",
+        });
+      }
+
+      let stagingCompleted = false;
+      let stagingFailureMessage: string | undefined;
       console.log("before start:");
       for (const pack of appData.packsData) {
         console.log(pack.name, pack.readTables);
@@ -16238,6 +16648,36 @@ export const registerIpcMainListeners = (
           messages: [message],
           startTime: Date.now(),
         } as Toast);
+      };
+      let workshopStagingResult: WorkshopStagingResult | undefined;
+      let stagedGamePath: string | undefined;
+      const cleanStagingAfterFailedLaunch = async () => {
+        if (!workshopStagingResult || !stagedGamePath) return;
+        try {
+          await cleanupWorkshopModStaging(stagedGamePath);
+          appData.workshopStagingCleanupPending = false;
+          appData.workshopStagingCleanupGamePath = undefined;
+          log(`Cleaned ${WORKSHOP_MOD_STAGING_FOLDER} after the game failed to launch.`);
+        } catch (error) {
+          reportWorkshopCleanupFailure(error);
+        }
+      };
+      const reportStagingProgress = (
+        progress: WorkshopStagingProgress,
+        status: WorkshopModStagingProgressStatus = "running",
+        overrides: Partial<WorkshopModStagingProgressEvent> = {},
+      ) => {
+        if (!workshopStagingRun) return;
+        workshopStagingRun.lastProgress = progress;
+        sendWorkshopStagingProgress(
+          event.sender,
+          makeWorkshopStagingProgressEvent(workshopStagingRun.runId, progress, status, overrides),
+        );
+      };
+      const throwIfWorkshopStagingCanceled = () => {
+        if (workshopStagingRun?.canceled) {
+          throw new WorkshopModStagingError("CANCELED", "Workshop mod staging was canceled.");
+        }
       };
       try {
         // getSkillsData(mods.filter((mod) => mod.isEnabled));
@@ -16263,9 +16703,64 @@ export const registerIpcMainListeners = (
         const appDataPath = app.getPath("userData");
         const myModsPath = nodePath.join(gamePath, "my_mods.txt");
         const usedModsPath = nodePath.join(gamePath, "used_mods.txt");
-        let sortedMods = sortByNameAndLoadOrder(
-          mods.filter((mod) => mod.isEnabled),
-        );
+        let sortedMods = sortByNameAndLoadOrder(mods.filter((mod) => mod.isEnabled));
+        const workshopModStagingMode =
+          startGameOptions.workshopModStagingMode === "copy" || startGameOptions.workshopModStagingMode === "symlink"
+            ? startGameOptions.workshopModStagingMode
+            : "disabled";
+        const cleanUpWorkshopModStagingAfterGameExit = !!startGameOptions.cleanUpWorkshopModStagingAfterGameExit;
+        const compressWorkshopMods =
+          appData.currentGame === "wh3" &&
+          workshopModStagingMode === "copy" &&
+          startGameOptions.compressWorkshopModsOnStart === true;
+        let realDataPackNames = new Set<string>();
+        let stagedWorkshopModNames = new Set<string>();
+        if (workshopModStagingMode !== "disabled") {
+          throwIfWorkshopStagingCanceled();
+          realDataPackNames = await getRealDataPackNames(dataFolder);
+          stagedGamePath = gamePath;
+          workshopStagingResult = await stageWorkshopMods({
+            gameFolder: gamePath,
+            mode: workshopModStagingMode,
+            workshopMods: sortedMods.filter((mod) => isWorkshopMod(mod)),
+            realDataPackNames,
+            canCreateSymbolicLinks: appData.canCreateSymbolicLinks,
+            recreateDestination: cleanUpWorkshopModStagingAfterGameExit,
+            compressMods: compressWorkshopMods,
+            includeRigidModelV2: appData.isRigidModelV2CompressionEnabled,
+            signal: workshopStagingRun?.controller.signal,
+            onProgress: (progress) => reportStagingProgress(progress),
+          });
+          stagingCompleted = true;
+          reportStagingProgress(
+            {
+              phase: "completed",
+              current: workshopStagingResult.entries.length,
+              total: workshopStagingResult.entries.length,
+              message: "Workshop mods ready",
+            },
+            "complete",
+            { stage: "complete", percent: 100, detail: "Workshop mods ready" },
+          );
+          if (activeWorkshopStagingRun === workshopStagingRun) activeWorkshopStagingRun = undefined;
+          stagedWorkshopModNames = new Set(workshopStagingResult.stagedModNames.map((name) => name.toLowerCase()));
+          log(
+            `Prepared ${stagedWorkshopModNames.size} Workshop mod(s) in ${workshopStagingResult.destinationPath}; ` +
+              `${workshopStagingResult.changedEntries.length} changed entr${
+                workshopStagingResult.changedEntries.length === 1 ? "y" : "ies"
+              }.`,
+          );
+          for (const warning of workshopStagingResult.compressionWarnings) {
+            const localizedWarning = i18n.t("automaticWorkshopStagingWarning", { warning });
+            console.warn(localizedWarning);
+            mainWindow?.webContents.send("handleLog", localizedWarning);
+            mainWindow?.webContents.send("addToast", {
+              type: "warning",
+              messages: [localizedWarning],
+              startTime: Date.now(),
+            } as Toast);
+          }
+        }
         const moddingFolderPacks = await createModdingFolderPacks(
           nodePath.join(dataFolder, "modding"),
           nodePath.join(gamePath, WHMM_MODDING_FOLDER),
@@ -16704,24 +17199,20 @@ export const registerIpcMainListeners = (
             console.log(`Added flow pack to mod list: ${packFileName}`);
           }
         }
-        const workingDirectoryLines = Array.from(
-          new Set(
-            enabledModsWithoutMergedInMods
-              .filter((mod) => !mod.isInModding)
-              .filter(
-                (mod) =>
-                  nodePath.relative(
-                    appData.gamesToGameFolderPaths[appData.currentGame]
-                      .dataFolder as string,
-                    mod.modDirectory,
-                  ) != "",
-              )
-              .map(
-                (mod) =>
-                  `add_working_directory "${linuxBit + mod.modDirectory}";`,
-              ),
-          ),
-        );
+        const workingDirectoryLines = buildWorkshopStagingWorkingDirectoryLines({
+          dataFolder: dataFolder as string,
+          destinationPath:
+            workshopStagingResult?.destinationPath || nodePath.join(gamePath, WORKSHOP_MOD_STAGING_FOLDER),
+          stagedModNames: stagedWorkshopModNames,
+          realDataPackNames,
+          pathPrefix: linuxBit,
+          mods: enabledModsWithoutMergedInMods.map((mod) => ({
+            name: mod.name,
+            modDirectory: mod.modDirectory,
+            isInModding: mod.isInModding,
+            isWorkshop: isWorkshopMod(mod),
+          })),
+        });
         const text =
           workingDirectoryLines
             .concat(
@@ -16756,6 +17247,7 @@ export const registerIpcMainListeners = (
             });
         } catch (e) {
           console.error(e);
+          await cleanStagingAfterFailedLaunch();
           return;
         }
         let fileNameWithModList = "used_mods.txt";
@@ -16774,9 +17266,8 @@ export const registerIpcMainListeners = (
           gameToProcessName[appData.currentGame],
         );
         if (!fs.existsSync(gameExecutablePath)) {
-          reportGameLaunchError(
-            `Game executable not found: ${gameExecutablePath}`,
-          );
+          reportGameLaunchError(`Game executable not found: ${gameExecutablePath}`);
+          await cleanStagingAfterFailedLaunch();
           return;
         }
 
@@ -16788,6 +17279,7 @@ export const registerIpcMainListeners = (
         });
         if (launchPlan.kind === "error") {
           reportGameLaunchError(launchPlan.message);
+          await cleanStagingAfterFailedLaunch();
           return;
         }
         // Create steam_appid.txt for Attila
@@ -16820,7 +17312,12 @@ export const registerIpcMainListeners = (
         const launchResult = await launchGame(launchPlan.candidates, gamePath);
         if (!launchResult.started) {
           reportGameLaunchError(launchResult.message);
+          await cleanStagingAfterFailedLaunch();
           return;
+        }
+        if (cleanUpWorkshopModStagingAfterGameExit && workshopStagingResult) {
+          appData.workshopStagingCleanupPending = true;
+          appData.workshopStagingCleanupGamePath = gamePath;
         }
         appData.compatData = {
           packTableCollisions: [],
@@ -16840,10 +17337,84 @@ export const registerIpcMainListeners = (
           app.exit();
         }
       } catch (e) {
-        console.log(e);
+        const wasCanceled =
+          !stagingCompleted &&
+          (workshopStagingRun?.canceled || workshopStagingRun?.controller.signal.aborted || event.sender.isDestroyed());
+        if (wasCanceled || (e instanceof WorkshopModStagingError && e.code === "CANCELED")) {
+          if (e instanceof WorkshopModStagingError && e.code === "CANCELED" && workshopStagingRun) {
+            workshopStagingRun.canceled = true;
+          }
+          stagingFailureMessage = "Workshop mod staging canceled.";
+          return;
+        }
+
+        await cleanStagingAfterFailedLaunch();
+        if (e instanceof WorkshopModStagingError) {
+          const message =
+            e.code === "INSUFFICIENT_SPACE"
+              ? i18n.t("automaticWorkshopStagingInsufficientSpace", {
+                  required: formatWorkshopStagingBytes(e.requiredBytes ?? 0),
+                  available: formatWorkshopStagingBytes(e.availableBytes ?? 0),
+                  destination: e.destinationPath || WORKSHOP_MOD_STAGING_FOLDER,
+                })
+              : e.code === "SYMLINK_UNAVAILABLE"
+                ? i18n.t("automaticWorkshopStagingSymlinkUnavailable")
+                : i18n.t("automaticWorkshopStagingFailed", { error: e.message });
+          stagingFailureMessage = message;
+          reportGameLaunchError(message, e);
+        } else {
+          stagingFailureMessage = e instanceof Error ? e.message : String(e);
+          console.log(e);
+        }
+      } finally {
+        if (workshopStagingRun && !stagingCompleted) {
+          const canceled =
+            workshopStagingRun.canceled || workshopStagingRun.controller.signal.aborted || event.sender.isDestroyed();
+          if (canceled) {
+            reportStagingProgress(
+              {
+                ...workshopStagingRun.lastProgress,
+                phase: "canceled",
+                message: "Workshop mod staging canceled.",
+              },
+              "cancelled",
+              { stage: "canceled", detail: "Workshop mod staging canceled." },
+            );
+          } else {
+            reportStagingProgress(
+              {
+                ...workshopStagingRun.lastProgress,
+                message: stagingFailureMessage || "Workshop mod staging failed.",
+              },
+              "failed",
+              {
+                stage: "failed",
+                detail: stagingFailureMessage || "Workshop mod staging failed.",
+                error: stagingFailureMessage,
+              },
+            );
+          }
+          if (activeWorkshopStagingRun === workshopStagingRun) activeWorkshopStagingRun = undefined;
+        }
       }
     },
   );
+  ipcMain.on("cancelWorkshopModStaging", (event, requestedRunId?: string) => {
+    const run = activeWorkshopStagingRun;
+    if (!run || run.senderId !== event.sender.id) return;
+    if (typeof requestedRunId === "string" && requestedRunId.length > 0 && requestedRunId !== run.runId) return;
+    if (run.canceled) return;
+
+    run.canceled = true;
+    run.controller.abort();
+    sendWorkshopStagingProgress(event.sender, {
+      ...makeWorkshopStagingProgressEvent(run.runId, run.lastProgress, "canceling", {
+        stage: "cleaning",
+        detail: "Canceling Workshop mod staging…",
+      }),
+      status: "canceling",
+    });
+  });
   /**
    * Writes a compatibility report to a file the user picks.
    *
@@ -16873,17 +17444,77 @@ export const registerIpcMainListeners = (
         if (result.canceled || !result.filePath)
           return { success: false, canceled: true };
 
-        await fs.promises.writeFile(result.filePath, reportText, "utf8");
-        return { success: true, savedPath: result.filePath };
+      await fs.promises.writeFile(result.filePath, reportText, "utf8");
+      return { success: true, savedPath: result.filePath };
+    } catch (error) {
+      console.error("Error exporting compat report:", error);
+      return { success: false, error: error instanceof Error ? error.message : "Unknown error" };
+    } finally {
+      if (requestingWindow && !requestingWindow.isDestroyed()) requestingWindow.focus();
+    }
+  });
+  /**
+   * Writes the campaign map data to a JSON file the user picks.
+   *
+   * Defaults to the game folder because that is where the game reads a hand-written map.json from.
+   */
+  ipcMain.handle(
+    "exportRegionOwnership",
+    async (
+      event,
+      json: string,
+      suggestedName: string,
+    ): Promise<{ success: boolean; savedPath?: string; canceled?: boolean; error?: string }> => {
+      const requestingWindow = BrowserWindow.fromWebContents(event.sender);
+      let savedPath: string | undefined;
+      try {
+        const defaultDirectory =
+          appData.gamesToGameFolderPaths[appData.currentGame]?.gamePath || app.getPath("documents");
+        const result = await dialog.showSaveDialog(requestingWindow || mainWindow || new BrowserWindow(), {
+          defaultPath: nodePath.join(defaultDirectory, suggestedName || "map.json"),
+          filters: [{ name: "JSON", extensions: ["json"] }],
+        });
+        if (result.canceled || !result.filePath) return { success: false, canceled: true };
+
+        savedPath = result.filePath.toLowerCase().endsWith(".json") ? result.filePath : `${result.filePath}.json`;
+        await fs.promises.writeFile(savedPath, json, "utf8");
+        return { success: true, savedPath };
       } catch (error) {
-        console.error("Error exporting compat report:", error);
+        console.error("Error exporting region ownership:", error);
         return {
           success: false,
+          savedPath,
           error: error instanceof Error ? error.message : "Unknown error",
         };
       } finally {
-        if (requestingWindow && !requestingWindow.isDestroyed())
-          requestingWindow.focus();
+        if (requestingWindow && !requestingWindow.isDestroyed()) requestingWindow.focus();
+      }
+    },
+  );
+  /** Reads a region ownership file the user picks. Parsing stays in the renderer, with the map it applies to. */
+  ipcMain.handle(
+    "importRegionOwnership",
+    async (
+      event,
+    ): Promise<{ success: boolean; text?: string; filePath?: string; canceled?: boolean; error?: string }> => {
+      const requestingWindow = BrowserWindow.fromWebContents(event.sender);
+      try {
+        const defaultDirectory =
+          appData.gamesToGameFolderPaths[appData.currentGame]?.gamePath || app.getPath("documents");
+        const result = await dialog.showOpenDialog(requestingWindow || mainWindow || new BrowserWindow(), {
+          properties: ["openFile"],
+          defaultPath: defaultDirectory,
+          filters: [{ name: "JSON", extensions: ["json"] }],
+        });
+        if (result.canceled || result.filePaths.length === 0) return { success: false, canceled: true };
+
+        const filePath = result.filePaths[0];
+        return { success: true, text: await fs.promises.readFile(filePath, "utf8"), filePath };
+      } catch (error) {
+        console.error("Error importing region ownership:", error);
+        return { success: false, error: error instanceof Error ? error.message : "Unknown error" };
+      } finally {
+        if (requestingWindow && !requestingWindow.isDestroyed()) requestingWindow.focus();
       }
     },
   );
@@ -17417,10 +18048,298 @@ export const registerIpcMainListeners = (
           success: false,
           writtenCount,
           skipped,
-          error:
-            error instanceof Error
-              ? error.message
-              : "Failed to export packed files",
+          error: error instanceof Error ? error.message : "Failed to export packed files",
+        };
+      }
+    },
+  );
+  ipcMain.handle(
+    "extractVisualsFilesToDirectory",
+    async (
+      _event,
+      sessionId: string,
+      outputDirectory: string,
+      filePaths: string[],
+      preserveFolders = true,
+      preferredPackPath?: string,
+      excludeCommonTextures = false,
+      recursive = false,
+    ): Promise<PackExportResult> => {
+      const skipped: Array<{ name: string; reason: string }> = [];
+      let writtenCount = 0;
+      const errors: string[] = [];
+
+      try {
+        const session = visualsSessions.get(sessionId);
+        if (!session) return { success: false, writtenCount, skipped, error: "Visuals session expired or missing" };
+        if (!outputDirectory) return { success: false, writtenCount, skipped, error: "No output directory selected" };
+        if (!Array.isArray(filePaths) || filePaths.length === 0) {
+          return { success: false, writtenCount, skipped, error: "No files to extract" };
+        }
+
+        let filePathsToExtract = filePaths;
+        const recursivelyResolvedFiles = new Map<
+          string,
+          { pack: Pack; packPath: string; fileName: string }
+        >();
+        if (recursive) {
+          if (filePaths.length !== 1) {
+            return {
+              success: false,
+              writtenCount,
+              skipped,
+              error: "Recursive Visuals extraction requires exactly one root file",
+            };
+          }
+
+          const dependencyFileIds = new Map<string, number>();
+          const dependencyTextCache = new Map<string, string | undefined>();
+          const dependencyPackCache = new Map<string, Pack | undefined>();
+          const dependencyResolveStartedAt = performance.now();
+          const getDependencyFileId = (packPath: string) => {
+            const packKey = packPath.replaceAll("\\", "/").toLowerCase();
+            const existing = dependencyFileIds.get(packKey);
+            if (existing !== undefined) return existing;
+            const fileId = fs.openSync(packPath, "r");
+            dependencyFileIds.set(packKey, fileId);
+            return fileId;
+          };
+
+          let dependencyClosure: VisualDependencyClosure;
+          try {
+            dependencyClosure = await collectVisualDependencyClosure(filePaths[0], async (requestedPath) => {
+              const requestedExtension = getSupportedVisualDependencyExtension(requestedPath);
+              const resolved = await resolveVisualsFileInSession(session, requestedPath, {
+                variantMeshDefinitionFallback: requestedExtension === "variantmeshdefinition",
+                preferredPackPath,
+                packCache: dependencyPackCache,
+              });
+              if (!resolved?.pack || !resolved.packPath || !resolved.fileName) return undefined;
+
+              recursivelyResolvedFiles.set(normalizePackFilePathKey(resolved.fileName), {
+                pack: resolved.pack,
+                packPath: resolved.packPath,
+                fileName: resolved.fileName,
+              });
+
+              const resolvedExtension = getSupportedVisualDependencyExtension(resolved.fileName);
+              let text: string | undefined;
+              if (
+                resolvedExtension === "variantmeshdefinition" ||
+                resolvedExtension === "wsmodel" ||
+                resolvedExtension === "xml.material"
+              ) {
+                const cacheKey = `${resolved.packPath.replaceAll("\\", "/").toLowerCase()}|${normalizePackFilePathKey(
+                  resolved.fileName,
+                )}`;
+                if (dependencyTextCache.has(cacheKey)) {
+                  text = dependencyTextCache.get(cacheKey);
+                } else {
+                  const packedFile = findPackedFileCaseInsensitive(resolved.pack, resolved.fileName);
+                  if (packedFile) {
+                    let buffer = Buffer.allocUnsafe(packedFile.file_size);
+                    fs.readSync(
+                      getDependencyFileId(resolved.packPath),
+                      buffer,
+                      0,
+                      buffer.length,
+                      packedFile.start_pos,
+                    );
+                    if (packedFile.is_compressed) {
+                      buffer = Buffer.from(await decompressPackedPayload(buffer, packedFile.name));
+                    }
+                    text = decodePackedAssetText(buffer);
+                  }
+                  dependencyTextCache.set(cacheKey, text);
+                }
+              }
+
+              return { resolvedPath: resolved.fileName, text };
+            });
+          } finally {
+            for (const fileId of dependencyFileIds.values()) {
+              try {
+                fs.closeSync(fileId);
+              } catch (error) {
+                console.warn("Failed to close Visuals dependency pack handle:", error);
+              }
+            }
+          }
+
+          console.log(
+            `[Visuals isolated] resolved ${dependencyClosure.paths.length} supported file(s) from ${filePaths[0]} in ${(
+              performance.now() - dependencyResolveStartedAt
+            ).toFixed(0)}ms`,
+          );
+          filePathsToExtract = dependencyClosure.paths;
+          skipped.push(
+            ...dependencyClosure.missing.map((name) => ({
+              name,
+              reason: "Referenced file was not found in the visuals packs",
+            })),
+          );
+          if (filePathsToExtract.length === 0) {
+            return {
+              success: false,
+              writtenCount,
+              skipped,
+              error: "No supported Visuals files were resolved from the root file",
+            };
+          }
+        }
+
+        const uniqueRequestedPaths = Array.from(
+          new Map(
+            filePathsToExtract
+              .map((filePath) => [normalizePackFilePathKey(filePath), filePath] as const)
+              .filter(([key]) => key.length > 0),
+          ).values(),
+        );
+        const filesByPack = new Map<
+          string,
+          {
+            pack: Pack;
+            packPath: string;
+            files: Array<{ requestedPath: string; fileName: string; outputPath: string }>;
+          }
+        >();
+        const outputDirectories = new Set<string>();
+        const flatOutputNames = new Set<string>();
+
+        for (const requestedPath of uniqueRequestedPaths) {
+          const recursiveResolved = recursive
+            ? recursivelyResolvedFiles.get(normalizePackFilePathKey(requestedPath))
+            : undefined;
+          const resolved =
+            recursiveResolved ??
+            (await resolveVisualsFileInSession(session, requestedPath, { preferredPackPath }));
+          if (!resolved?.pack || !resolved.packPath || !resolved.fileName) {
+            skipped.push({ name: requestedPath, reason: "File was not found in the visuals packs" });
+            continue;
+          }
+
+          if (excludeCommonTextures && /(?:^|[\\/])commontextures(?:[\\/]|$)/i.test(resolved.fileName)) {
+            skipped.push({ name: requestedPath, reason: "Commontextures file excluded" });
+            continue;
+          }
+
+          if (!preserveFolders) {
+            const flatName = nodePath.posix.basename(resolved.fileName.replaceAll("\\", "/"));
+            const flatKey = flatName.toLowerCase();
+            if (flatOutputNames.has(flatKey)) {
+              skipped.push({ name: requestedPath, reason: `Flat extraction name collision: ${flatName}` });
+              continue;
+            }
+            flatOutputNames.add(flatKey);
+          }
+
+          const normalizedPath = resolved.fileName.replaceAll("\\", "/");
+          const relativePath = preserveFolders ? normalizedPath : nodePath.posix.basename(normalizedPath);
+          const outputPath = resolveExportOutputPath(outputDirectory, relativePath);
+          if (!outputPath) {
+            skipped.push({ name: requestedPath, reason: "Invalid output path" });
+            continue;
+          }
+          outputDirectories.add(nodePath.dirname(outputPath));
+
+          const packKey = resolved.packPath.replaceAll("\\", "/").toLowerCase();
+          const group = filesByPack.get(packKey);
+          if (group) group.files.push({ requestedPath, fileName: resolved.fileName, outputPath });
+          else {
+            filesByPack.set(packKey, {
+              pack: resolved.pack,
+              packPath: resolved.packPath,
+              files: [{ requestedPath, fileName: resolved.fileName, outputPath }],
+            });
+          }
+        }
+
+        const writeOutput = async (name: string, outputPath: string, contents: Buffer) => {
+          try {
+            await fs.promises.writeFile(outputPath, contents);
+            writtenCount += 1;
+          } catch (error) {
+            errors.push(`${name}: ${error instanceof Error ? error.message : "Failed to write file"}`);
+          }
+        };
+
+        const extractionStartedAt = performance.now();
+        const ensureDirResults = await Promise.allSettled(
+          Array.from(outputDirectories, (directory) => fsExtra.ensureDir(directory)),
+        );
+        for (const result of ensureDirResults) {
+          if (result.status === "rejected") {
+            errors.push(result.reason instanceof Error ? result.reason.message : "Failed to create extraction directory");
+          }
+        }
+
+        const maxConcurrentWrites = 8;
+        const pendingWrites = new Set<Promise<void>>();
+        const enqueueWrite = async (name: string, outputPath: string, contents: Buffer) => {
+          let writePromise!: Promise<void>;
+          writePromise = writeOutput(name, outputPath, contents).finally(() => {
+            pendingWrites.delete(writePromise);
+          });
+          pendingWrites.add(writePromise);
+          if (pendingWrites.size >= maxConcurrentWrites) {
+            await Promise.race(pendingWrites);
+          }
+        };
+        for (const group of filesByPack.values()) {
+          let fileId = -1;
+          try {
+            fileId = fs.openSync(group.packPath, "r");
+            for (const target of group.files) {
+              const packedFile = findPackedFileCaseInsensitive(group.pack, target.fileName);
+              if (!packedFile) {
+                skipped.push({ name: target.requestedPath, reason: "File was not found in the pack" });
+                continue;
+              }
+
+              try {
+                let buffer = Buffer.allocUnsafe(packedFile.file_size);
+                fs.readSync(fileId, buffer, 0, buffer.length, packedFile.start_pos);
+                if (packedFile.is_compressed) {
+                  buffer = Buffer.from(await decompressPackedPayload(buffer, packedFile.name));
+                }
+                await enqueueWrite(target.requestedPath, target.outputPath, buffer);
+              } catch (error) {
+                skipped.push({
+                  name: target.requestedPath,
+                  reason: error instanceof Error ? error.message : "Could not read payload",
+                });
+              }
+            }
+          } catch (error) {
+            errors.push(error instanceof Error ? error.message : "Could not read visual files");
+          } finally {
+            if (fileId >= 0) {
+              try {
+                fs.closeSync(fileId);
+              } catch (error) {
+                console.warn("Failed to close Visuals extraction pack handle:", error);
+              }
+            }
+          }
+        }
+        await Promise.all(pendingWrites);
+        if (recursive) {
+          console.log(
+            `[Visuals isolated] wrote ${writtenCount} file(s) from ${filesByPack.size} pack(s) in ${(
+              performance.now() - extractionStartedAt
+            ).toFixed(0)}ms`,
+          );
+        }
+
+        const error = errors.length > 0 ? errors.join("\n") : undefined;
+        return { success: !error, writtenCount, skipped, ...(error ? { error } : {}) };
+      } catch (error) {
+        console.error("Error extracting Visuals files:", error);
+        return {
+          success: false,
+          writtenCount,
+          skipped,
+          error: error instanceof Error ? error.message : "Failed to extract Visuals files",
         };
       }
     },

@@ -3,7 +3,7 @@ import { exec, spawn, spawnSync } from "child_process";
 import { app, autoUpdater, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 import installExtension, { REACT_DEVELOPER_TOOLS, REDUX_DEVTOOLS } from "electron-devtools-installer";
 import fetch from "electron-fetch";
-import isDev from "electron-is-dev";
+import electronIsDev from "electron-is-dev";
 import * as fs from "fs";
 import { updateAvailable } from "gh-release-fetch";
 import { version } from "../package.json";
@@ -14,7 +14,7 @@ import { isMainThread } from "worker_threads";
 import electronLog from "electron-log/main";
 import i18n, { getLocaleDirectory } from "./configs/i18next.config";
 import { globSync } from "glob";
-import { windows, registerIpcMainListeners } from "./ipcMainListeners";
+import { cleanupWorkshopStagingAfterGameExit, windows, registerIpcMainListeners } from "./ipcMainListeners";
 import * as https from "https";
 import { Extract } from "unzipper";
 import { isSupportedLanguage } from "./utility/sharedHelpers";
@@ -24,6 +24,7 @@ import { findGameProcessIds, setGameProcessPriority } from "./utility/gameProces
 import { forkSteamWorker as fork } from "./steamWorker";
 import { buildWindowsUpdateBootstrapScript, buildWindowsUpdateScript } from "./utility/updateScripts";
 import { buildUpdateTempDirPath, removeStaleUpdateTempDirs } from "./utility/updateTempDirs";
+import { isWindowsDeveloperModeEnabled } from "./utility/windowsDeveloperMode";
 
 //-------------- HOT RELOAD DOESN'T RELOAD INDEX.TS
 
@@ -32,6 +33,8 @@ import { buildUpdateTempDirPath, removeStaleUpdateTempDirs } from "./utility/upd
 // whether you're running in development or production).
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
+
+const isDev = electronIsDev || process.env.WHMM_FORCE_DEV !== undefined;
 
 const gotTheLock = app.requestSingleInstanceLock();
 
@@ -47,17 +50,22 @@ if (!gotTheLock) {
   // Has to happen before the app is ready, so it cannot live beside the handler registered later.
   registerAssetSchemeAsPrivileged();
 
-  console.log("ARGVS:", process.argv);
   appData.startArgs = process.argv.slice(1);
 
   if (process.platform === "win32") {
     exec("NET SESSION", function (err, so, se) {
       appData.isAdmin = se.length === 0;
       console.log("isAdmin:", appData.isAdmin);
+      void isWindowsDeveloperModeEnabled().then((isDeveloperModeEnabled) => {
+        appData.canCreateSymbolicLinks = appData.isAdmin || isDeveloperModeEnabled;
+        windows.mainWindow?.webContents.send("setCanCreateSymbolicLinks", appData.canCreateSymbolicLinks);
+        console.log("canCreateSymbolicLinks:", appData.canCreateSymbolicLinks);
+      });
     });
   } else {
     // Creating symbolic links does not require an elevated process on Unix-like systems.
     appData.isAdmin = true;
+    appData.canCreateSymbolicLinks = true;
     console.log("isAdmin: true (Unix symbolic links do not require elevation)");
   }
 
@@ -642,6 +650,7 @@ exec ${quoteForShell(process.execPath)}
       windows.mainWindow?.webContents.send("setIsDev", isDev);
       windows.mainWindow?.webContents.send("setStartArgs", appData.startArgs);
       windows.mainWindow?.webContents.send("setIsAdmin", appData.isAdmin);
+      windows.mainWindow?.webContents.send("setCanCreateSymbolicLinks", appData.canCreateSymbolicLinks);
       windows.mainWindow?.webContents.send("setSkillsViewOptions", {
         isShowingSkillNodeSetNames: appData.isShowingSkillNodeSetNames,
         hideRepeatedKeyPrefixes: appData.hideRepeatedKeyPrefixes,
@@ -668,6 +677,7 @@ exec ${quoteForShell(process.execPath)}
             const isGameRunning = processIds.length > 0;
 
             if (appData.isWH3Running !== isGameRunning) {
+              const didGameStop = appData.isWH3Running && !isGameRunning;
               if (appData.isChangingGameProcessPriority && isGameRunning && !appData.isWH3Running) {
                 console.log("Setting process priority to high...");
                 try {
@@ -689,6 +699,7 @@ exec ${quoteForShell(process.execPath)}
               }
               appData.isWH3Running = isGameRunning;
               windows.mainWindow?.webContents.send("setIsWH3Running", appData.isWH3Running);
+              if (didGameStop) void cleanupWorkshopStagingAfterGameExit();
             }
           } catch (e) {
             console.log("Game process check failed:", e);

@@ -1,8 +1,9 @@
-import { supportedGames, SupportedGames } from "../supportedGames";
+import { supportedGames, SupportedGames, vanillaPackNames } from "../supportedGames";
 import type { GameFolderPaths } from "../appData";
 import { sortByNameAndLoadOrder } from "../modSortingHelpers";
 import { toPresetEntries, toSnapshotEntries } from "./presetEntries";
 import { SortingType } from "../utility/modRowSorting";
+import { sanitizeRecentPackPaths } from "../utility/recentPackPaths";
 
 /**
  * The config file used to store a full Mod record for every mod in every preset, which made it grow
@@ -45,6 +46,9 @@ export const emptyGameConfig = (): GameConfig => ({
   currentPreset: { name: "", mods: [], version: 2 },
   presets: [],
   modUserData: {},
+  loadOrderRules: [],
+  disabledModLoadOrderRules: [],
+  loadOrderRuleDisabledPacks: [],
 });
 
 const emptyGames = () =>
@@ -106,6 +110,10 @@ const migrateGame = (legacy: LegacyAppConfig, game: SupportedGames): GameConfig 
       .filter((preset) => preset && preset.name != null)
       .map((preset) => legacyPresetToSavedPreset(preset, isSnapshotPreset(preset.name))),
     modUserData,
+    // Rules did not exist before this version, so there is nothing to carry across.
+    loadOrderRules: [],
+    disabledModLoadOrderRules: [],
+    loadOrderRuleDisabledPacks: [],
   };
 };
 
@@ -138,6 +146,11 @@ const withDefaults = (config: AppConfig): AppConfig => {
     games[game] = { ...emptyGameConfig(), ...games[game] };
   }
 
+  const workshopModStagingMode =
+    config.workshopModStagingMode === "copy" || config.workshopModStagingMode === "symlink"
+      ? config.workshopModStagingMode
+      : "disabled";
+
   return {
     ...config,
     configVersion: CONFIG_VERSION,
@@ -153,11 +166,22 @@ const withDefaults = (config: AppConfig): AppConfig => {
     hiddenMainWindowTabs: config.hiddenMainWindowTabs ?? [],
     isVisualsSortByCultureEnabled: config.isVisualsSortByCultureEnabled ?? true,
     isVisualsHideDuplicatesEnabled: config.isVisualsHideDuplicatesEnabled ?? true,
+    unitViewerMode: config.unitViewerMode === "compare" ? "compare" : "visualize",
+    unitViewerShowWireframe: config.unitViewerShowWireframe ?? true,
+    unitViewerUnsyncedAnimations: config.unitViewerUnsyncedAnimations ?? true,
+    unitViewerShowUnitCard: config.unitViewerShowUnitCard ?? true,
     moddersPrefix: config.moddersPrefix ?? "",
+    isRigidModelV2CompressionEnabled: config.isRigidModelV2CompressionEnabled ?? true,
+    compressModsOnUpload: config.compressModsOnUpload ?? true,
+    workshopModStagingMode,
+    compressWorkshopModsOnStart: workshopModStagingMode === "copy" && !!config.compressWorkshopModsOnStart,
+    cleanUpWorkshopModStagingAfterGameExit:
+      workshopModStagingMode !== "disabled" && !!config.cleanUpWorkshopModStagingAfterGameExit,
     modRowsSortingType: config.modRowsSortingType ?? SortingType.Ordered,
     enabledModsPaneSortingType: config.enabledModsPaneSortingType ?? SortingType.Ordered,
     currentGame: config.currentGame ?? "wh3",
     hideRepeatedKeyPrefixes: config.hideRepeatedKeyPrefixes ?? true,
+    recentPackPaths: sanitizeRecentPackPaths(config.recentPackPaths, vanillaPackNames),
   };
 };
 

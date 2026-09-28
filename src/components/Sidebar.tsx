@@ -83,6 +83,11 @@ const Sidebar = memo(() => {
   const isSkipIntroMoviesEnabled = useAppSelector((state) => state.app.isSkipIntroMoviesEnabled);
   const isAutoStartCustomBattleEnabled = useAppSelector((state) => state.app.isAutoStartCustomBattleEnabled);
   const isClosedOnPlay = useAppSelector((state) => state.app.isClosedOnPlay);
+  const workshopModStagingMode = useAppSelector((state) => state.app.workshopModStagingMode);
+  const compressWorkshopModsOnStart = useAppSelector((state) => state.app.compressWorkshopModsOnStart);
+  const cleanUpWorkshopModStagingAfterGameExit = useAppSelector(
+    (state) => state.app.cleanUpWorkshopModStagingAfterGameExit,
+  );
   const packDataOverwrites = useAppSelector((state) => state.app.packDataOverwrites);
   const userFlowOptions = useAppSelector((state) => state.app.userFlowOptions);
   const filter = useAppSelector((state) => state.app.filter);
@@ -185,6 +190,9 @@ const Sidebar = memo(() => {
               isScriptLoggingEnabled,
               isAutoStartCustomBattleEnabled,
               isClosedOnPlay,
+              workshopModStagingMode,
+              compressWorkshopModsOnStart,
+              cleanUpWorkshopModStagingAfterGameExit,
               packDataOverwrites,
               userFlowOptions,
             });
@@ -199,6 +207,9 @@ const Sidebar = memo(() => {
         isScriptLoggingEnabled,
         isAutoStartCustomBattleEnabled,
         isClosedOnPlay,
+        workshopModStagingMode,
+        compressWorkshopModsOnStart,
+        cleanUpWorkshopModStagingAfterGameExit,
         packDataOverwrites,
         userFlowOptions,
       });
@@ -208,6 +219,9 @@ const Sidebar = memo(() => {
       dispatch,
       isAutoStartCustomBattleEnabled,
       isClosedOnPlay,
+      workshopModStagingMode,
+      compressWorkshopModsOnStart,
+      cleanUpWorkshopModStagingAfterGameExit,
       isMakeUnitsGeneralsEnabled,
       isScriptLoggingEnabled,
       isSkipIntroMoviesEnabled,
@@ -253,6 +267,9 @@ const Sidebar = memo(() => {
                 isScriptLoggingEnabled,
                 isAutoStartCustomBattleEnabled,
                 isClosedOnPlay,
+                workshopModStagingMode,
+                compressWorkshopModsOnStart,
+                cleanUpWorkshopModStagingAfterGameExit,
                 packDataOverwrites,
                 userFlowOptions,
               },
@@ -272,6 +289,9 @@ const Sidebar = memo(() => {
           isScriptLoggingEnabled,
           isAutoStartCustomBattleEnabled,
           isClosedOnPlay,
+          workshopModStagingMode,
+          compressWorkshopModsOnStart,
+          cleanUpWorkshopModStagingAfterGameExit,
           packDataOverwrites,
           userFlowOptions,
         },
@@ -282,6 +302,9 @@ const Sidebar = memo(() => {
       areModsInOrder,
       isAutoStartCustomBattleEnabled,
       isClosedOnPlay,
+      workshopModStagingMode,
+      compressWorkshopModsOnStart,
+      cleanUpWorkshopModStagingAfterGameExit,
       isMakeUnitsGeneralsEnabled,
       isScriptLoggingEnabled,
       isSkipIntroMoviesEnabled,
@@ -384,11 +407,6 @@ const Sidebar = memo(() => {
     getUpdateData();
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === "f") {
-        const filterInput = document.getElementById("filterInput");
-        filterInput?.focus();
-      }
-
       if (e.key === "Shift") isShiftDownRef.current = true;
       if (e.key === "Control") isControlDownRef.current = true;
     };
@@ -446,6 +464,9 @@ const Sidebar = memo(() => {
   }, [isWH3Running, isWaitingForRelaunch, isWaitingForContinueRelaunch, onContinueGameClicked, playGameClicked]);
 
   const enabledMods = getEnabledMods(mods, alwaysEnabledModNames);
+  const outdatedPackFilesForEnabledMods = Object.fromEntries(
+    Object.entries(outdatedPackFiles).filter(([packName]) => enabledMods.some((mod) => mod.name === packName)),
+  );
   const conflictingStartposMods = getConflictingStartposMods(enabledMods);
 
   const possiblyOutdatedWorkshopMods = enabledMods
@@ -746,7 +767,7 @@ const Sidebar = memo(() => {
               className="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500"
             ></input>
 
-            <span className="absolute right-[0.65rem] top-8 text-gray-400">
+            <span className="absolute right-[0.65rem] top-8 text-gray-400 scale-150">
               <button onClick={() => clearFilter()}>
                 <FontAwesomeIcon icon={faXmark} />
               </button>
@@ -874,7 +895,7 @@ const Sidebar = memo(() => {
             </div>
           )}
 
-          {currentGame == "wh3" && Object.keys(outdatedPackFiles).length > 0 && (
+          {currentGame == "wh3" && Object.keys(outdatedPackFilesForEnabledMods).length > 0 && (
             <div className="text-center text-red-700 font-semibold mb-4">
               <div className="make-tooltip-w-full">
                 <SidebarTooltip
@@ -882,7 +903,7 @@ const Sidebar = memo(() => {
                   content={
                     <>
                       <p>{localized.packsWithOutdatedFiles}</p>
-                      {Object.entries(outdatedPackFiles).map(([packName, overwrittenFileNames]) => (
+                      {Object.entries(outdatedPackFilesForEnabledMods).map(([packName, overwrittenFileNames]) => (
                         <div key={packName}>
                           <span className="">{`${packName}:`}</span>
                           {overwrittenFileNames.map((packedFileName) => (

@@ -541,6 +541,19 @@ export const resolveForeignSlotTypes = (data: BuiltBuildingsData): BuildingsFore
     });
 
 /**
+ * Returns the total active settlement slots for the imported primary building. The table is keyed
+ * by the primary chain and its numeric level, so a secondary building must never influence this
+ * value even if it happens to be the one currently selected in the editor.
+ */
+export const resolveMaxBuildingSlotCount = (data: BuiltBuildingsData, primaryBuilding?: string): number | undefined => {
+  if (!primaryBuilding) return undefined;
+  const level = data.levelsByKey[primaryBuilding];
+  if (!level) return undefined;
+  return data.campaignBuildingChainSlotUnlocksByChain?.[level.chain]?.find((row) => row.level === level.level)
+    ?.activeSlotCount;
+};
+
+/**
  * The cultures this query would leave with an empty board.
  *
  * Horde boards only. Most of the game's cultures have no horde at all - 17 of vanilla's 27 draw
@@ -706,6 +719,7 @@ export const resolveRegionBuildings = (data: BuiltBuildingsData, query: Building
         const tile: BuildingsTile = {
           levelKey,
           chainKey,
+          superChainKey: chain?.superChain || undefined,
           setKey,
           level: level.level,
           // Horde chains are numbered from 0 throughout, so their first tier is already `I`.
@@ -738,6 +752,14 @@ export const resolveRegionBuildings = (data: BuiltBuildingsData, query: Building
           isSettlementOrPort: isSettlementOrPortChain,
           isDuplicatedAcrossSets: targetSets.length > 1,
           isForeignSlot: foreignSlotChains.has(chainKey) || (chain?.isForeignSlotChain ?? false),
+          slotTypes: slotTypes ? [...slotTypes].sort() : [],
+          slotTemplates: [
+            ...new Set(
+              (sourcesByChain.get(chainKey) ?? [])
+                .filter((source) => source.startsWith("slot_template:"))
+                .map((source) => source.slice("slot_template:".length).split(" via ")[0]),
+            ),
+          ].sort(),
         };
         const chainBuckets = bandBuckets.get(setKey) ?? new Map<string, BuildingsTile[]>();
         const tiles = chainBuckets.get(chainKey) ?? [];
@@ -814,6 +836,7 @@ export const resolveRegionBuildings = (data: BuiltBuildingsData, query: Building
     }
   }
 
+  const maxSlotCount = resolveMaxBuildingSlotCount(data, query.primaryBuilding);
   return {
     query,
     bands,
@@ -823,5 +846,6 @@ export const resolveRegionBuildings = (data: BuiltBuildingsData, query: Building
     disabledLevels,
     existingBuildings,
     slotTemplates,
+    ...(maxSlotCount === undefined ? {} : { maxSlotCount }),
   };
 };

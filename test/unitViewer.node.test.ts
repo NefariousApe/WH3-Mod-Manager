@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { calculateUnitViewerStats } from "../src/unitViewer/calculator";
-import { buildUnitViewerData, createLocLookup, type UnitViewerTableRows } from "../src/unitViewer/data";
+import {
+  buildUnitViewerData,
+  createLocLookup,
+  resolveCharacterExperienceThreshold,
+  type UnitViewerTableRows,
+} from "../src/unitViewer/data";
 import type { UnitViewerConstants, UnitViewerEntity, UnitViewerUnitModel } from "../src/unitViewer/types";
 
 const rider: UnitViewerEntity = {
@@ -432,6 +437,50 @@ describe("Unit Viewer catalog", () => {
     expect(built.units.get("unit_d")?.name).toBe("Delta");
   });
 
+  it("derives culture-specific lord subtype and associated-unit choices", () => {
+    const tables: UnitViewerTableRows = {
+      main_units_tables: [
+        { unit: "lord_unit", land_unit: "lord_land", num_men: "1", caste: "lord" },
+        { unit: "lord_unit_override", land_unit: "lord_land_override", num_men: "1", caste: "lord" },
+      ],
+      land_units_tables: [
+        { key: "lord_land", man_entity: "entity", primary_melee_weapon: "weapon" },
+        { key: "lord_land_override", man_entity: "entity", primary_melee_weapon: "weapon" },
+      ],
+      battle_entities_tables: [{ key: "entity", type: "man", hit_points: "100", mass: "100" }],
+      melee_weapons_tables: [{ key: "weapon", damage: "10", ap_damage: "5" }],
+      factions_tables: [
+        { key: "faction_a", subculture: "subculture_a" },
+        { key: "faction_b", subculture: "subculture_b" },
+      ],
+      units_custom_battle_permissions_tables: [
+        { unit: "lord_unit", faction: "faction_a" },
+        { unit: "lord_unit_override", faction: "faction_b" },
+      ],
+      agent_subtypes_tables: [{ key: "lord_subtype", associated_unit_override: "lord_unit" }],
+      agent_subtype_subculture_overrides_tables: [
+        {
+          subtype: "lord_subtype",
+          subculture: "subculture_b",
+          associated_unit_override: "lord_unit_override",
+        },
+      ],
+    };
+    const built = buildUnitViewerData(tables, (key) =>
+      key === "agent_subtypes_onscreen_name_override_lord_subtype" ? "Localized Lord" : undefined,
+    );
+
+    expect(built.lordOptions).toEqual([
+      {
+        subtype: "lord_subtype",
+        name: "Localized Lord",
+        associatedUnit: "lord_unit",
+        subcultureKeys: ["subculture_b", "subculture_a"],
+        associatedUnitBySubculture: { subculture_b: "lord_unit_override" },
+      },
+    ]);
+  });
+
   it("buckets units into the game's roster groups and falls back to the extended roster", () => {
     const tables: UnitViewerTableRows = {
       main_units_tables: [
@@ -490,6 +539,39 @@ describe("Unit Viewer catalog", () => {
       unit_none: "campaign_exclusives",
     });
     expect(built.groups[0].units[0].unitCardPath).toBe("ui\\units\\icons\\unit_lord.png");
+  });
+
+  it("keeps lords in the Lords roster section when UI grouping data puts them under Heroes", () => {
+    const tables: UnitViewerTableRows = {
+      main_units_tables: [
+        {
+          unit: "misgrouped_lord",
+          land_unit: "land",
+          num_men: "1",
+          caste: "lord",
+          ui_unit_group_land: "grouping_hero",
+        },
+      ],
+      land_units_tables: [{ key: "land", man_entity: "entity", primary_melee_weapon: "weapon" }],
+      battle_entities_tables: [{ key: "entity", type: "man", hit_points: "100", mass: "100" }],
+      melee_weapons_tables: [{ key: "weapon", damage: "10", ap_damage: "5" }],
+      ui_unit_groupings_tables: [
+        { key: "grouping_hero", parent_group: "heroes_agents" },
+        { key: "grouping_lord", parent_group: "commander" },
+      ],
+      ui_unit_group_parents_tables: [
+        { key: "commander", order: "10" },
+        { key: "heroes_agents", order: "20" },
+      ],
+      factions_tables: [{ key: "faction", subculture: "culture" }],
+      units_custom_battle_permissions_tables: [{ unit: "misgrouped_lord", faction: "faction" }],
+    };
+
+    const built = buildUnitViewerData(tables, () => undefined);
+
+    expect(Object.fromEntries(built.groups[0].units.map((unit) => [unit.key, unit.uiGroupKey]))).toEqual({
+      misgrouped_lord: "commander",
+    });
   });
 
   it("lets later mod rows replace vanilla unit and scalar constants", () => {
@@ -551,5 +633,206 @@ describe("Unit Viewer catalog", () => {
     );
 
     expect(built.groups[0].units[0].originPackPath).toBe("/mods/example.pack");
+  });
+
+  it("resolves the selected unit's variant mesh definition path", () => {
+    const built = buildUnitViewerData(
+      {
+        main_units_tables: [{ unit: "unit", land_unit: "land", num_men: "1" }],
+        land_units_tables: [{ key: "land", man_entity: "entity", primary_melee_weapon: "weapon" }],
+        battle_entities_tables: [{ key: "entity", type: "man", hit_points: "100", mass: "100" }],
+        melee_weapons_tables: [{ key: "weapon", damage: "10", ap_damage: "5" }],
+        unit_variants_tables: [{
+          unit: "land",
+          faction: "",
+          name: "unit_variant_name",
+          variant: "unit_variant",
+          unit_card: "unit_card",
+        }],
+        factions_tables: [
+          {
+            key: "faction_a",
+            subculture: "subculture_a",
+            uniform_colour_primary: "11189196",
+            uniform_colour_secondary: "1122867",
+            uniform_colour_tertiary: "4478310",
+          },
+          {
+            key: "faction_b",
+            subculture: "subculture_b",
+            uniform_colour_primary: "14544639",
+            uniform_colour_secondary: "6715272",
+            uniform_colour_tertiary: "10070715",
+          },
+          {
+            key: "faction_a_minor",
+            subculture: "subculture_a",
+            uniform_colour_primary: "15987699",
+            uniform_colour_secondary: "8598323",
+            uniform_colour_tertiary: "16777215",
+          },
+          {
+            key: "unrelated_faction",
+            subculture: "subculture_other",
+            uniform_colour_primary: "16711680",
+            uniform_colour_secondary: "65280",
+            uniform_colour_tertiary: "255",
+          },
+        ],
+        unit_variants_colours_tables: [
+          {
+            unit_variant: "land",
+            faction: "faction_a",
+            subculture: "",
+            soldier_type: "soldier",
+            primary_colour_r: "16",
+            primary_colour_g: "16",
+            primary_colour_b: "16",
+            secondary_colour_r: "32",
+            secondary_colour_g: "32",
+            secondary_colour_b: "32",
+            tertiary_colour_r: "48",
+            tertiary_colour_g: "48",
+            tertiary_colour_b: "48",
+          },
+          {
+            unit_variant: "land",
+            faction: "",
+            subculture: "subculture_b",
+            soldier_type: "soldier",
+            primary_colour_r: "64",
+            primary_colour_g: "64",
+            primary_colour_b: "64",
+            secondary_colour_r: "80",
+            secondary_colour_g: "80",
+            secondary_colour_b: "80",
+            tertiary_colour_r: "96",
+            tertiary_colour_g: "96",
+            tertiary_colour_b: "96",
+          },
+          {
+            unit_variant: "land",
+            faction: "",
+            subculture: "",
+            soldier_type: "mount",
+            primary_colour_r: "112",
+            primary_colour_g: "112",
+            primary_colour_b: "112",
+            secondary_colour_r: "128",
+            secondary_colour_g: "128",
+            secondary_colour_b: "128",
+            tertiary_colour_r: "144",
+            tertiary_colour_g: "144",
+            tertiary_colour_b: "144",
+          },
+        ],
+        variants_tables: [{
+          variant_name: "unit_variant",
+          tech_folder: "tech",
+          variant_filename: "units\\human",
+          low_poly_filename: "low\\human",
+          mount_scale: "1.0000",
+          scale: "1.0500",
+          scale_variation: "0.0500",
+          super_low_poly_filename: "imposter\\human",
+        }],
+        units_custom_battle_permissions_tables: [
+          { unit: "unit", faction: "faction_b" },
+          { unit: "unit", faction: "faction_a" },
+        ],
+      },
+      () => undefined,
+    );
+
+    expect(built.units.get("unit")?.variantMeshPath).toBe(
+      "variantmeshes\\variantmeshdefinitions\\units\\human.variantmeshdefinition",
+    );
+    expect(built.groups[0].units[0].variantMeshPath).toBe(
+      "variantmeshes\\variantmeshdefinitions\\units\\human.variantmeshdefinition",
+    );
+    expect(built.units.get("unit")?.painterVariantContext).toEqual({
+      unitKey: "land",
+      faction: "",
+      variantName: "unit_variant",
+      unitVariantName: "unit_variant_name",
+      unitCard: "unit_card",
+      variantDetails: {
+        techFolder: "tech",
+        variantFilename: "units\\human",
+        lowPolyFilename: "low\\human",
+        mountScale: "1.0000",
+        scale: "1.0500",
+        scaleVariation: "0.0500",
+        superLowPolyFilename: "imposter\\human",
+      },
+      availableFactions: ["faction_a", "faction_b"],
+      factionColours: [
+        { faction: "faction_a", subculture: "subculture_a", primary: "#aabbcc", secondary: "#112233", tertiary: "#445566" },
+        { faction: "faction_a_minor", subculture: "subculture_a", primary: "#f3f3f3", secondary: "#833333", tertiary: "#ffffff" },
+        { faction: "faction_b", subculture: "subculture_b", primary: "#ddeeff", secondary: "#667788", tertiary: "#99aabb" },
+      ],
+      unitVariantColours: [
+        {
+          faction: "faction_a", subculture: "", soldierType: "soldier",
+          primary: "#101010", secondary: "#202020", tertiary: "#303030",
+        },
+        {
+          faction: "", subculture: "subculture_b", soldierType: "soldier",
+          primary: "#404040", secondary: "#505050", tertiary: "#606060",
+        },
+        {
+          faction: "", subculture: "", soldierType: "mount",
+          primary: "#707070", secondary: "#808080", tertiary: "#909090",
+        },
+      ],
+    });
+  });
+
+  it("resolves character XP with campaign and agent-specific rows taking precedence", () => {
+    const built = buildUnitViewerData(
+      {
+        character_experience_skill_tiers_tables: [
+          { agent_key: "", skill_rank: "4", experience_threshold: "1000", for_army: "false", for_navy: "false" },
+          { agent_key: "general", skill_rank: "4", experience_threshold: "1500", for_army: "true", for_navy: "false" },
+          {
+            agent_key: "general",
+            skill_rank: "4",
+            experience_threshold: "2000",
+            optional_campaign_key: "campaign_a",
+            for_army: "true",
+            for_navy: "false",
+          },
+        ],
+        faction_agent_permitted_subtypes_tables: [
+          { faction: "faction_a", agent: "general", subtype: "lord_a", mod_disabled: "false" },
+        ],
+      },
+      () => undefined,
+    );
+
+    expect(
+      resolveCharacterExperienceThreshold(built.characterExperience, {
+        faction: "faction_a",
+        subtype: "lord_a",
+        campaign: "campaign_a",
+        rank: 4,
+        forArmy: true,
+      }),
+    ).toBe(2000);
+    expect(
+      resolveCharacterExperienceThreshold(built.characterExperience, {
+        faction: "faction_a",
+        subtype: "lord_a",
+        campaign: "campaign_b",
+        rank: 4,
+        forArmy: true,
+      }),
+    ).toBe(1500);
+    expect(
+      resolveCharacterExperienceThreshold(built.characterExperience, {
+        rank: 4,
+        forArmy: false,
+      }),
+    ).toBe(1000);
   });
 });

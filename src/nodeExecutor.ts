@@ -5,10 +5,11 @@ import {
   getDBVersion,
   getPacksTableData,
   readPack,
+  readDBPackedFilesFromIndex,
   typeToBuffer,
   writePack,
 } from "./packFileSerializer";
-import { readVanillaPackFromCache } from "./vanillaDbCache/store";
+import { fillVanillaTablesFromCache, readVanillaPackFromCache } from "./vanillaDbCache/store";
 import appData from "./appData";
 import {
   AmendedSchemaField,
@@ -17,6 +18,7 @@ import {
   DBVersion,
   DBField,
   Pack,
+  PackSource,
   PackedFile,
 } from "./packFileTypes";
 import { format } from "date-fns";
@@ -56,9 +58,12 @@ import {
 } from "./schema";
 import { getFilterValueCandidates, normalizeFilterMatchMode } from "./nodeGraph/types";
 import type { FilterRow } from "./nodeGraph/types";
+import { buildDefaultCellValue } from "./utility/dbRowCells";
 import { TextFileEditRule, applyTextFileEdits, matchesTextFileTarget } from "./nodeGraph/textFileEdits";
 import type { TextFileFormatter } from "./nodeGraph/textFileFormatting";
 import { PackFileOperationRule, planPackCopy, planPackFileOperations } from "./nodeGraph/packFileOperations";
+import { applyEditXmlFile } from "./nodeGraph/editXmlFile";
+import type { EditXmlFileConfig } from "./nodeGraph/editXmlFile";
 import {
   DeepClonePlan,
   LoadedTableFile,
@@ -67,6 +72,11 @@ import {
   parseFilenameRelativePaths,
 } from "./flowDeepClone";
 import type { DeepCloneOverride, DeepCloneTreeNode, DeepCloneVariantAxis, LocTextRule } from "./nodeGraph/nodes/types";
+import {
+  buildCompactPackIndex,
+  findCompactPackFilesUnderPrefix,
+  forEachCompactPackFileName,
+} from "./utility/compactPackIndex";
 
 // Global tracking for counter transformations to ensure uniqueness across the entire flow
 // Map structure: sourceColumnId -> Set of used numbers
@@ -85,6 +95,23 @@ const hotPathLog = (executionContext: FlowExecutionContext | undefined, ...args:
   }
 
   console.log(...args);
+};
+
+/** Avoid asking Node/Electron's console to inspect entire tables and pack indexes on hot paths. */
+const summarizeFlowInput = (input: any): Record<string, unknown> => {
+  if (Array.isArray(input)) {
+    return { inputCount: input.length, inputTypes: input.map((entry) => entry?.type ?? typeof entry) };
+  }
+  if (!input || typeof input !== "object") return { type: typeof input };
+  if (input.type === "PackFiles") return { type: input.type, packCount: input.files?.length ?? 0 };
+  if (input.type === "TableSelection") {
+    return { type: input.type, tableCount: input.tables?.length ?? 0, sourcePackCount: input.sourceFiles?.length ?? 0 };
+  }
+  if (input.type === "ColumnSelection") return { type: input.type, columnGroupCount: input.columns?.length ?? 0 };
+  if (input.type === "ChangedColumnSelection") {
+    return { type: input.type, columnGroupCount: input.adjustedInputData?.columns?.length ?? 0 };
+  }
+  return { type: input.type ?? "object" };
 };
 
 /**
@@ -173,6 +200,248 @@ const getRowsForPackedFile = (
   const rows = chunkSchemaIntoRows(packedFile.schemaFields, packedFile.tableSchema) as AmendedSchemaField[][];
   executionContext.rowsByPackedFile.set(packedFile as PackedFile, rows);
   return rows;
+};
+
+/**
+ * The logical table a packed DB file belongs to. A DB file's first two path components are the
+ * table name; everything after that is a source-file variant/subname. Keep this comparison
+ * independent of the pack that supplied the file: the effective row is chosen by the packed DB
+ * filename alone.
+ */
+const getCanonicalLogicalTableName = (packedFileName: string): string => {
+  const normalizedName = packedFileName.replace(/[\\/]+/g, "\\").toLowerCase();
+  const [folder, tableName] = normalizedName.split("\\");
+  return folder === "db" && tableName ? `db\\${tableName}` : normalizedName;
+};
+
+const normalizePackedDbFileName = (packedFileName: string): string =>
+  packedFileName.replace(/[\\/]+/g, "\\").toLowerCase();
+
+const cloneEffectiveSchemaField = (field: AmendedSchemaField): AmendedSchemaField => structuredClone(field);
+
+type EffectiveRowCandidate = {
+  tableIndex: number;
+  rowIndex: number;
+  logicalTableName: string;
+  key: string;
+  normalizedFileName: string;
+};
+
+type PreparedEffectiveTable = {
+  tableData: DBTablesNodeTable;
+  rows: AmendedSchemaField[][];
+  keyFields: DBField[];
+  logicalTableName: string;
+  normalizedFileName: string;
+  hasSchemaRows: boolean;
+};
+
+/**
+ * Returns the rows the game would expose from a set of source-pack table entries.
+ *
+ * Rows are identities by the complete schema key tuple, while the source-file variant is the only
+ * winner signal. This is deliberately separate from pack load priority: a flow can receive the
+ * same packed DB file from different packs, and the requested effective-row semantics compare the
+ * file names/subnames rather than the packs carrying them. Equal normalized file names retain the
+ * first row encountered.
+ *
+ * Every output descriptor and schema field is copied. In particular, callers may safely amend the
+ * returned table without changing the PackedFile cached on the source Pack.
+ */
+export const resolveEffectiveTableRows = (
+  tableEntries: readonly DBTablesNodeTable[],
+  executionContext?: FlowExecutionContext,
+): DBTablesNodeTable[] => {
+  const preparedTables: PreparedEffectiveTable[] = tableEntries.map((tableData) => {
+    const table = tableData.table;
+    const keyFields = table.tableSchema?.fields?.filter((field) => field.is_key) ?? [];
+    const hasSchemaRows = !!table.tableSchema && !!table.schemaFields;
+
+    return {
+      tableData,
+      rows: hasSchemaRows ? getRowsForPackedFile(table, executionContext) : [],
+      keyFields,
+      logicalTableName: getCanonicalLogicalTableName(table.name),
+      normalizedFileName: normalizePackedDbFileName(table.name),
+      hasSchemaRows,
+    };
+  });
+
+  const getKeyForRow = (preparedTable: PreparedEffectiveTable, row: AmendedSchemaField[]): string | undefined => {
+    if (preparedTable.keyFields.length === 0) return undefined;
+
+    const keyValues: Array<[string, unknown]> = [];
+    for (const keyField of preparedTable.keyFields) {
+      const keyCell = row.find((cell) => cell.name === keyField.name);
+      if (!keyCell || keyCell.resolvedKeyValue === undefined || keyCell.resolvedKeyValue === null) {
+        return undefined;
+      }
+      keyValues.push([keyField.name, keyCell.resolvedKeyValue]);
+    }
+
+    // JSON array encoding is collision-safe for values containing separators or other delimiters.
+    return JSON.stringify(keyValues);
+  };
+
+  const winnersByLogicalTableAndKey = new Map<string, EffectiveRowCandidate>();
+  for (let tableIndex = 0; tableIndex < preparedTables.length; tableIndex++) {
+    const preparedTable = preparedTables[tableIndex];
+    if (!preparedTable.hasSchemaRows || preparedTable.keyFields.length === 0) continue;
+
+    for (let rowIndex = 0; rowIndex < preparedTable.rows.length; rowIndex++) {
+      const key = getKeyForRow(preparedTable, preparedTable.rows[rowIndex]);
+      // A row without a complete tuple cannot safely participate in deduplication; retain it.
+      if (key === undefined) continue;
+
+      const candidate: EffectiveRowCandidate = {
+        tableIndex,
+        rowIndex,
+        logicalTableName: preparedTable.logicalTableName,
+        key,
+        normalizedFileName: preparedTable.normalizedFileName,
+      };
+      const identity = JSON.stringify([candidate.logicalTableName, candidate.key]);
+      const currentWinner = winnersByLogicalTableAndKey.get(identity);
+
+      // Lower lexical filename wins. Keeping the existing winner on equality gives stable
+      // first-encountered behavior without consulting pack names or load order.
+      if (!currentWinner || candidate.normalizedFileName < currentWinner.normalizedFileName) {
+        winnersByLogicalTableAndKey.set(identity, candidate);
+      }
+    }
+  }
+
+  const cloneTableDataWithRows = (
+    tableData: DBTablesNodeTable,
+    rows: AmendedSchemaField[][] | undefined,
+  ): DBTablesNodeTable => ({
+    ...tableData,
+    table: {
+      ...tableData.table,
+      ...(rows ? { schemaFields: rows.flatMap((row) => row.map(cloneEffectiveSchemaField)) } : {}),
+      ...(rows === undefined && tableData.table.schemaFields
+        ? { schemaFields: tableData.table.schemaFields.map((field) => structuredClone(field)) }
+        : {}),
+    },
+  });
+
+  const effectiveTables: DBTablesNodeTable[] = [];
+  for (let tableIndex = 0; tableIndex < preparedTables.length; tableIndex++) {
+    const preparedTable = preparedTables[tableIndex];
+    if (!preparedTable.hasSchemaRows) {
+      // No schema data means there is no safe row extraction rule. Preserve the entry and clone its
+      // schema fields if present.
+      effectiveTables.push(cloneTableDataWithRows(preparedTable.tableData, undefined));
+      continue;
+    }
+
+    const retainedRows =
+      preparedTable.keyFields.length === 0
+        ? preparedTable.rows
+        : preparedTable.rows.filter((row, rowIndex) => {
+            const key = getKeyForRow(preparedTable, row);
+            if (key === undefined) return true;
+
+            const identity = JSON.stringify([preparedTable.logicalTableName, key]);
+            const winner = winnersByLogicalTableAndKey.get(identity);
+            return winner?.tableIndex === tableIndex && winner.rowIndex === rowIndex;
+          });
+
+    // A table entry that lost all of its rows should not be emitted at all.
+    if (retainedRows.length > 0) {
+      effectiveTables.push(cloneTableDataWithRows(preparedTable.tableData, retainedRows));
+    }
+  }
+
+  return effectiveTables;
+};
+
+type JoinTableLike = {
+  table: Pick<PackedFile, "tableSchema">;
+};
+
+/**
+ * Cross joins can combine different schema versions of the same table. Use the most complete
+ * schema as the preferred order, then add any fields only present in another version or in an
+ * already-amended row. The latter keeps this working for IndexedTable values, which do not retain
+ * every table that contributed rows.
+ */
+const getJoinSchemaFields = (tables: JoinTableLike[], rows: AmendedSchemaField[][] = []): DBField[] => {
+  const schemas = tables.map((table) => table.table.tableSchema?.fields ?? []).filter((fields) => fields.length > 0);
+  const preferredSchema = schemas.reduce<DBField[]>(
+    (preferred, fields) => (fields.length > preferred.length ? fields : preferred),
+    [],
+  );
+  const schemaFields: DBField[] = [];
+  const seenNames = new Set<string>();
+
+  const addField = (field: DBField) => {
+    if (!field.name || seenNames.has(field.name)) return;
+    seenNames.add(field.name);
+    schemaFields.push({ ...field });
+  };
+
+  for (const field of preferredSchema) addField(field);
+  for (const schema of schemas) {
+    for (const field of schema) addField(field);
+  }
+  for (const row of rows) {
+    for (const cell of row) {
+      if (!cell.name || seenNames.has(cell.name)) continue;
+      addField({
+        name: cell.name,
+        field_type: cell.type as SCHEMA_FIELD_TYPE,
+        is_key: cell.isKey || false,
+        default_value: "",
+        is_filename: false,
+        is_reference: [],
+        description: "Joined column",
+        ca_order: -1,
+        is_bitwise: 0,
+        enum_values: {},
+      });
+    }
+  }
+
+  return schemaFields;
+};
+
+const cloneJoinCell = (cell: AmendedSchemaField, name: string): AmendedSchemaField => ({
+  ...cell,
+  name,
+  fields: cell.fields.map((field) => ({ ...field })),
+});
+
+const createDefaultJoinCell = (field: DBField): AmendedSchemaField =>
+  buildDefaultCellValue(field.name, field.field_type, field.default_value ?? "", field.is_key);
+
+/**
+ * Give every row in a cross join the same cells, in the same order. Rows from an older schema are
+ * aligned by their field names and receive cells initialized from the schema defaults for columns
+ * that were added later. The positional fallback is for rows that have not gone through
+ * amendSchemaField yet.
+ */
+const normalizeRowsForJoinSchema = (
+  rows: AmendedSchemaField[][],
+  rowSchemaFields: DBField[],
+  joinSchemaFields: DBField[],
+): AmendedSchemaField[][] => {
+  if (joinSchemaFields.length === 0) return rows;
+
+  const defaultRowTemplate = joinSchemaFields.map((field) => createDefaultJoinCell(field));
+
+  return rows.map((row) => {
+    const cellsByName = new Map<string, AmendedSchemaField>();
+    row.forEach((cell, index) => {
+      const name = cell.name || rowSchemaFields[index]?.name;
+      if (name && !cellsByName.has(name)) cellsByName.set(name, cell);
+    });
+
+    return joinSchemaFields.map((field, index) => {
+      const cell = cellsByName.get(field.name);
+      return cell ? cloneJoinCell(cell, field.name) : cloneJoinCell(defaultRowTemplate[index], field.name);
+    });
+  });
 };
 
 const getMergeIdentityColumnNames = (
@@ -353,6 +622,25 @@ const readPackCached = async (
   return cachedPackPromise;
 };
 
+const getCompactPackIndexCached = async (packPath: string, executionContext: FlowExecutionContext) => {
+  const resolvedPackPath = resolveFlowSourcePackPath(packPath, executionContext);
+  let cached = executionContext.packIndexCache.get(resolvedPackPath);
+  if (!cached) {
+    const startedAt = performance.now();
+    cached = readPack(resolvedPackPath, { skipParsingTables: true, skipSorting: true }).then((pack) => {
+      const index = buildCompactPackIndex(pack);
+      flowExecutionDebugLog(
+        executionContext,
+        `[flow pack index] ${index.name}: ${index.names.count} files in ${(performance.now() - startedAt).toFixed(1)}ms`,
+      );
+      return index;
+    });
+    executionContext.packIndexCache.set(resolvedPackPath, cached);
+    cached.catch(() => executionContext.packIndexCache.delete(resolvedPackPath));
+  }
+  return cached;
+};
+
 const cacheTableFilesForPack = (pack: Pack, tableNames: string[], executionContext?: FlowExecutionContext): void => {
   if (!executionContext) {
     return;
@@ -439,25 +727,77 @@ const getTableFilesForPackAndTables = async (
   packPath: string,
   tableNames: string[],
   executionContext?: FlowExecutionContext,
-): Promise<{ pack: Pack; matchingTablesByName: Map<string, PackedFile[]> }> => {
-  const pack = await readPackCached(packPath, { tablesToRead: tableNames }, executionContext);
+): Promise<{ sourceFile: PackSource; matchingTablesByName: Map<string, PackedFile[]> }> => {
+  if (executionContext) {
+    const resolvedPackPath = resolveFlowSourcePackPath(packPath, executionContext);
+    const index = await getCompactPackIndexCached(resolvedPackPath, executionContext);
+    const indexMissingTableNames = tableNames.filter(
+      (tableName) => !executionContext.tableFilesByPackAndTable.has(`${index.path}|${tableName}`),
+    );
+    if (indexMissingTableNames.length > 0) {
+      const indexedFilesByName = new Map<string, PackedFile>();
+      for (const tableName of indexMissingTableNames) {
+        for (const file of findCompactPackFilesUnderPrefix(index, tableName)) indexedFilesByName.set(file.name, file);
+      }
+      const indexedFiles = [...indexedFilesByName.values()];
+      const parsedPack: Pack = {
+        name: index.name,
+        path: index.path,
+        packedFiles: indexedFiles,
+        packHeader: index.packHeader,
+        lastChangedLocal: index.mtimeMs,
+        size: index.size,
+        dependencyPacks: index.dependencyPacks,
+        readTables: indexMissingTableNames,
+      };
+
+      // Keep the purpose-built vanilla DB cache, but give it the reusable compact directory's
+      // matches instead of making it parse the physical pack index again for every table request.
+      const { unservedPrefixes } = await fillVanillaTablesFromCache(parsedPack, indexMissingTableNames, getDBVersion);
+      if (unservedPrefixes.length > 0) {
+        const filesToRead = indexedFiles.filter((file) =>
+          unservedPrefixes.some((prefix) => file.name.startsWith(prefix)),
+        );
+        const filesReadFromPack =
+          filesToRead.length > 0 ? await readDBPackedFilesFromIndex(index.path, filesToRead) : [];
+        for (const file of filesReadFromPack) indexedFilesByName.set(file.name, file);
+        parsedPack.packedFiles = [...indexedFilesByName.values()];
+      }
+
+      getPacksTableData([parsedPack], indexMissingTableNames);
+      for (const tableName of indexMissingTableNames) {
+        executionContext.tableFilesByPackAndTable.set(
+          `${index.path}|${tableName}`,
+          parsedPack.packedFiles.filter((file) => file.name === tableName || file.name.startsWith(`${tableName}\\`)),
+        );
+      }
+    }
+
+    return {
+      sourceFile: { name: index.name, path: index.path },
+      matchingTablesByName: new Map(
+        tableNames.map((tableName) => [
+          tableName,
+          executionContext.tableFilesByPackAndTable.get(`${index.path}|${tableName}`) ?? [],
+        ]),
+      ),
+    };
+  }
+
+  const pack = await readPackCached(packPath, { tablesToRead: tableNames });
   getPacksTableData([pack], tableNames);
-  cacheTableFilesForPack(pack, tableNames, executionContext);
 
   const matchingTablesByName = new Map<string, PackedFile[]>();
   for (const tableName of tableNames) {
-    const cacheKey = `${pack.path}|${tableName}`;
-    const cachedTables = executionContext?.tableFilesByPackAndTable.get(cacheKey);
     matchingTablesByName.set(
       tableName,
-      cachedTables ??
-        pack.packedFiles.filter(
-          (packedFile) => packedFile.name === tableName || packedFile.name.startsWith(`${tableName}\\`),
-        ),
+      pack.packedFiles.filter(
+        (packedFile) => packedFile.name === tableName || packedFile.name.startsWith(`${tableName}\\`),
+      ),
     );
   }
 
-  return { pack, matchingTablesByName };
+  return { sourceFile: { name: pack.name, path: pack.path }, matchingTablesByName };
 };
 
 const cloneNewPackedFile = (packedFile: NewPackedFile): NewPackedFile => ({
@@ -673,6 +1013,9 @@ export const executeNodeAction = async (request: NodeExecutionRequest): Promise<
 
       case "edittextfile":
         return await executeEditTextFileNode(nodeId, textValue, inputData, config, executionContext);
+
+      case "editxmlfile":
+        return await executeEditXmlFileNode(nodeId, textValue, inputData, config, executionContext);
 
       case "editloctext":
         return await executeEditLocTextNode(nodeId, textValue, inputData, config, executionContext);
@@ -976,7 +1319,7 @@ async function executeTableSelectionNode(
   inputData: PackFilesNodeData,
   executionContext?: FlowExecutionContext,
 ): Promise<NodeExecutionResult> {
-  console.log(`TableSelection Node ${nodeId}: Processing "${textValue}" with input:`, inputData);
+  console.log(`TableSelection Node ${nodeId}: Processing "${textValue}"`, summarizeFlowInput(inputData));
 
   if (!inputData || inputData.type !== "PackFiles") {
     return { success: false, error: "Invalid input: Expected PackFiles data" };
@@ -998,7 +1341,7 @@ async function executeTableSelectionNode(
     }
 
     try {
-      const { pack, matchingTablesByName } = await getTableFilesForPackAndTables(
+      const { sourceFile, matchingTablesByName } = await getTableFilesForPackAndTables(
         file.path,
         tableNames,
         executionContext,
@@ -1011,7 +1354,7 @@ async function executeTableSelectionNode(
           selectedTables.push({
             name: tableName,
             fileName: table.name,
-            sourceFile: pack,
+            sourceFile,
             table,
           });
         }
@@ -1021,13 +1364,15 @@ async function executeTableSelectionNode(
     }
   }
 
+  const effectiveTables = resolveEffectiveTableRows(selectedTables, executionContext);
+
   return {
     success: true,
     data: {
       type: "TableSelection",
-      tables: selectedTables,
+      tables: effectiveTables,
       sourceFiles: inputData.files,
-      tableCount: selectedTables.length,
+      tableCount: effectiveTables.length,
     } as DBTablesNodeData,
   };
 }
@@ -1043,8 +1388,8 @@ async function executeTableSelectionDropdownNode(
   const selectedTable = parsedConfig?.selectedTable ?? textValue;
 
   console.log(
-    `TableSelection Dropdown Node ${nodeId}: Processing selected table "${selectedTable}" with input:`,
-    inputData,
+    `TableSelection Dropdown Node ${nodeId}: Processing selected table "${selectedTable}"`,
+    summarizeFlowInput(inputData),
   );
 
   if (!inputData || inputData.type !== "PackFiles") {
@@ -1075,7 +1420,7 @@ async function executeTableSelectionDropdownNode(
     }
 
     try {
-      const { pack, matchingTablesByName } = await getTableFilesForPackAndTables(
+      const { sourceFile, matchingTablesByName } = await getTableFilesForPackAndTables(
         file.path,
         [tableName],
         executionContext,
@@ -1105,7 +1450,7 @@ async function executeTableSelectionDropdownNode(
         selectedTables.push({
           name: tableName,
           fileName: table.name,
-          sourceFile: pack,
+          sourceFile,
           table: limitedTable,
         });
       }
@@ -1114,13 +1459,15 @@ async function executeTableSelectionDropdownNode(
     }
   }
 
+  const effectiveTables = resolveEffectiveTableRows(selectedTables, executionContext);
+
   return {
     success: true,
     data: {
       type: "TableSelection",
-      tables: selectedTables,
+      tables: effectiveTables,
       sourceFiles: inputData.files,
-      tableCount: selectedTables.length,
+      tableCount: effectiveTables.length,
     } as DBTablesNodeData,
   };
 }
@@ -1131,7 +1478,7 @@ async function executeColumnSelectionNode(
   inputData: DBTablesNodeData,
   executionContext?: FlowExecutionContext,
 ): Promise<NodeExecutionResult> {
-  console.log(`ColumnSelection Node ${nodeId}: Processing "${textValue}" with input:`, inputData);
+  console.log(`ColumnSelection Node ${nodeId}: Processing "${textValue}"`, summarizeFlowInput(inputData));
 
   if (!inputData || inputData.type !== "TableSelection") {
     return { success: false, error: "Invalid input: Expected TableSelection data" };
@@ -1184,7 +1531,7 @@ async function executeGroupByColumnsNode(
   config?: unknown,
 ): Promise<NodeExecutionResult> {
   console.log(`GroupByColumns Node ${nodeId}: Processing with textValue:`, textValue);
-  console.log(`GroupByColumns Node ${nodeId}: Input data:`, inputData);
+  console.log(`GroupByColumns Node ${nodeId}: Input`, summarizeFlowInput(inputData));
 
   if (!inputData || inputData.type !== "TableSelection") {
     return { success: false, error: "Invalid input: Expected TableSelection data" };
@@ -1748,7 +2095,7 @@ async function executeReferenceLookupNode(
     }
 
     try {
-      const { pack, matchingTablesByName } = await getTableFilesForPackAndTables(
+      const { sourceFile: referencedSourceFile, matchingTablesByName } = await getTableFilesForPackAndTables(
         sourceFile.path,
         [tableNameToSearch],
         executionContext,
@@ -1763,7 +2110,7 @@ async function executeReferenceLookupNode(
         referencedTables.push({
           name: tableNameToSearch,
           fileName: table.name,
-          sourceFile: pack,
+          sourceFile: referencedSourceFile,
           table,
         });
       }
@@ -1772,8 +2119,10 @@ async function executeReferenceLookupNode(
     }
   }
 
+  const effectiveReferencedTables = resolveEffectiveTableRows(referencedTables, executionContext);
+
   console.log(
-    `Reference Lookup Node ${nodeId}: Found ${referencedTables.length} table(s) matching "${selectedReferenceTable}"`,
+    `Reference Lookup Node ${nodeId}: Found ${effectiveReferencedTables.length} table(s) matching "${selectedReferenceTable}"`,
   );
 
   // Filter the referenced tables to only include rows with matching key values
@@ -1784,7 +2133,7 @@ async function executeReferenceLookupNode(
     tableCount: 0,
   };
 
-  for (const tableData of referencedTables) {
+  for (const tableData of effectiveReferencedTables) {
     if (!tableData.table.schemaFields || !tableData.table.tableSchema) {
       // No schema, include the whole table
       filteredReferencedTables.tables.push(tableData);
@@ -1865,7 +2214,11 @@ async function executeReverseReferenceLookupNode(
   }
 
   // Parse selected reverse table and includeBaseGame from textValue
-  const parsed = getNodeConfig<{ selectedReverseTable?: string; includeBaseGame?: boolean }>(config, textValue);
+  const parsed = getNodeConfig<{
+    selectedReverseTable?: string;
+    includeBaseGame?: boolean;
+    connectedTableName?: string;
+  }>(config, textValue);
   if (!parsed) {
     return { success: false, error: "Invalid node configuration" };
   }
@@ -1896,10 +2249,13 @@ async function executeReverseReferenceLookupNode(
     }
   }
 
-  // Get the input table name to find reverse references
-  let inputTableName = "";
+  // A lookup/filter node can emit a generated table name while retaining the schema identity of
+  // the table it was derived from. Use that identity for reference matching; generated names are
+  // not present in DB field metadata.
+  let inputTableName = parsed.connectedTableName?.trim() || "";
+  inputTableName = inputTableName.replace(/^db\\/, "").replace(/\\.*$/, "");
   if (inputData.tables.length > 0) {
-    inputTableName = inputData.tables[0].name.replace(/^db\\/, "").replace(/\\.*$/, "");
+    inputTableName ||= inputData.tables[0].name.replace(/^db\\/, "").replace(/\\.*$/, "");
   }
 
   // If no reverse table is selected, try to auto-select if there's only one option
@@ -1923,17 +2279,19 @@ async function executeReverseReferenceLookupNode(
       if (!sourceFile.loaded) continue;
 
       try {
-        // Read the pack without parsing tables to get the list of table names
-        const pack = await readPackCached(sourceFile.path, { skipParsingTables: true }, executionContext);
+        // Reuse the compact directory; no full Pack or filename array is retained by this flow.
+        const packIndex = executionContext
+          ? await getCompactPackIndexCached(sourceFile.path, executionContext)
+          : buildCompactPackIndex(await readPack(sourceFile.path, { skipParsingTables: true, skipSorting: true }));
 
         // Get all unique db table names (base names without variants)
         const dbTableNames = new Set<string>();
-        for (const packedFile of pack.packedFiles) {
-          if (packedFile.name.startsWith("db\\")) {
-            const baseTableName = packedFile.name.replace(/^db\\/, "").replace(/\\.*$/, "");
+        forEachCompactPackFileName(packIndex, (fileName) => {
+          if (fileName.startsWith("db\\")) {
+            const baseTableName = fileName.replace(/^db\\/, "").replace(/\\.*$/, "");
             dbTableNames.add(baseTableName);
           }
-        }
+        });
 
         console.log(
           `Reverse Reference Lookup Node ${nodeId}: Found ${dbTableNames.size} potential table(s) in ${sourceFile.name}`,
@@ -2095,7 +2453,7 @@ async function executeReverseReferenceLookupNode(
     }
 
     try {
-      const { pack, matchingTablesByName } = await getTableFilesForPackAndTables(
+      const { sourceFile: reverseSourceFile, matchingTablesByName } = await getTableFilesForPackAndTables(
         sourceFile.path,
         [tableNameToSearch],
         executionContext,
@@ -2108,7 +2466,7 @@ async function executeReverseReferenceLookupNode(
             table: packedFile,
             name: packedFile.name,
             fileName: packedFile.name,
-            sourceFile: pack,
+            sourceFile: reverseSourceFile,
           });
         }
       }
@@ -2117,7 +2475,11 @@ async function executeReverseReferenceLookupNode(
     }
   }
 
-  console.log(`Reverse Reference Lookup Node ${nodeId}: Found ${reverseTables.length} table(s) from pack files`);
+  const effectiveReverseTables = resolveEffectiveTableRows(reverseTables, executionContext);
+
+  console.log(
+    `Reverse Reference Lookup Node ${nodeId}: Found ${effectiveReverseTables.length} table(s) from pack files`,
+  );
 
   const filteredReverseTables: DBTablesNodeData = {
     type: "TableSelection",
@@ -2127,7 +2489,7 @@ async function executeReverseReferenceLookupNode(
   };
 
   // Filter rows in reverse tables that reference the input tables
-  for (const tableData of reverseTables) {
+  for (const tableData of effectiveReverseTables) {
     if (!tableData.table.schemaFields) {
       console.log(`tableData.table.schemaFields is undefined for table "${tableData.name}", skipping`);
       continue;
@@ -2279,7 +2641,7 @@ async function executeNumericAdjustmentNode(
     | DBNumericAdjustmentNodeData[],
   executionContext?: FlowExecutionContext,
 ): Promise<NodeExecutionResult> {
-  console.log(`NumericAdjustment Node ${nodeId}: Processing formula "${textValue}" with input:`, inputData);
+  console.log(`NumericAdjustment Node ${nodeId}: Processing formula "${textValue}"`, summarizeFlowInput(inputData));
 
   // Convert single input to array for uniform handling
   const inputs = Array.isArray(inputData) ? inputData : [inputData];
@@ -2457,7 +2819,7 @@ async function executeMathMaxNode(
   inputData: DBNumericAdjustmentNodeData | DBNumericAdjustmentNodeData[],
   executionContext?: FlowExecutionContext,
 ): Promise<NodeExecutionResult> {
-  console.log(`MathMax Node ${nodeId}: Processing with value "${textValue}" and input:`, inputData);
+  console.log(`MathMax Node ${nodeId}: Processing with value "${textValue}"`, summarizeFlowInput(inputData));
 
   // Convert single input to array for uniform handling
   const inputs = Array.isArray(inputData) ? inputData : [inputData];
@@ -2601,7 +2963,7 @@ async function executeMathCeilNode(
   inputData: DBNumericAdjustmentNodeData | DBNumericAdjustmentNodeData[],
   executionContext?: FlowExecutionContext,
 ): Promise<NodeExecutionResult> {
-  console.log(`MathCeil Node ${nodeId}: Processing with input:`, inputData);
+  console.log(`MathCeil Node ${nodeId}: Processing`, summarizeFlowInput(inputData));
 
   // Convert single input to array for uniform handling
   const inputs = Array.isArray(inputData) ? inputData : [inputData];
@@ -3278,7 +3640,7 @@ async function executeTextSurroundNode(
   inputData: any,
   config?: unknown,
 ): Promise<NodeExecutionResult> {
-  console.log(`TextSurround Node ${nodeId}: Processing with config "${textValue}" and input:`, inputData);
+  console.log(`TextSurround Node ${nodeId}: Processing with config "${textValue}"`, summarizeFlowInput(inputData));
 
   if (!inputData) {
     return { success: false, error: "Invalid input: No input data provided" };
@@ -3365,7 +3727,7 @@ async function executeAppendTextNode(
   inputData: any,
   config?: unknown,
 ): Promise<NodeExecutionResult> {
-  console.log(`AppendText Node ${nodeId}: Processing with config "${textValue}" and input:`, inputData);
+  console.log(`AppendText Node ${nodeId}: Processing with config "${textValue}"`, summarizeFlowInput(inputData));
 
   if (!inputData) {
     return { success: false, error: "Invalid input: No input data provided" };
@@ -3471,7 +3833,7 @@ async function executeAppendTextNode(
 }
 
 async function executeTextJoinNode(nodeId: string, textValue: string, inputData: any): Promise<NodeExecutionResult> {
-  console.log(`TextJoin Node ${nodeId}: Processing with separator "${textValue}" and input:`, inputData);
+  console.log(`TextJoin Node ${nodeId}: Processing with separator "${textValue}"`, summarizeFlowInput(inputData));
 
   if (!inputData) {
     return { success: false, error: "Invalid input: No input data provided" };
@@ -3523,7 +3885,10 @@ async function executeGroupedColumnsToTextNode(
   inputData: any,
   config?: unknown,
 ): Promise<NodeExecutionResult> {
-  console.log(`GroupedColumnsToText Node ${nodeId}: Processing with config "${textValue}" and input:`, inputData);
+  console.log(
+    `GroupedColumnsToText Node ${nodeId}: Processing with config "${textValue}"`,
+    summarizeFlowInput(inputData),
+  );
 
   if (!inputData) {
     return { success: false, error: "Invalid input: No input data provided" };
@@ -3728,6 +4093,7 @@ async function executeLookupNode(
 
   // Handle both IndexedTable and TableSelection for the second input
   let indexedData: any;
+  let crossJoinRightSchemaFields: DBField[] | undefined;
 
   if (rightInputData.type === "IndexedTable") {
     // Already indexed, use as-is
@@ -3735,7 +4101,8 @@ async function executeLookupNode(
   } else if (rightInputData.type === "TableSelection") {
     if (joinType === "cross") {
       const allRightRows: AmendedSchemaField[][] = [];
-      let rightTable = rightInputData.tables[0];
+      let rightTable: DBTablesNodeTable | undefined;
+      crossJoinRightSchemaFields = getJoinSchemaFields(rightInputData.tables);
 
       for (const table of rightInputData.tables) {
         if (!table.table.schemaFields || !table.table.tableSchema) {
@@ -3747,7 +4114,11 @@ async function executeLookupNode(
         if (!rightTable) {
           rightTable = table;
         }
-        allRightRows.push(...rows);
+        allRightRows.push(
+          ...(crossJoinRightSchemaFields.length > 0
+            ? normalizeRowsForJoinSchema(rows, table.table.tableSchema.fields, crossJoinRightSchemaFields)
+            : rows),
+        );
       }
 
       if (!rightTable) {
@@ -3853,6 +4224,7 @@ async function executeLookupNode(
   }
 
   const allSourceRows: AmendedSchemaField[][] = [];
+  const crossSourceRowsByTable: Array<{ rows: AmendedSchemaField[][]; schemaFields: DBField[] }> = [];
   const sourceRowsWithLookupIndex: Array<{ row: AmendedSchemaField[]; lookupColumnIndex: number }> = [];
   const sourceTable = sourceData.tables[0]; // Keep first for metadata
 
@@ -3865,6 +4237,7 @@ async function executeLookupNode(
     const rows = getRowsForPackedFile(table.table, executionContext);
     if (joinType === "cross") {
       allSourceRows.push(...rows);
+      crossSourceRowsByTable.push({ rows, schemaFields: table.table.tableSchema.fields });
       continue;
     }
 
@@ -3894,22 +4267,41 @@ async function executeLookupNode(
     // Cross join: Cartesian product of all source rows with all right table rows
     hotPathLog(executionContext, `Lookup Node ${nodeId}: Performing cross join (Cartesian product)`);
 
+    const sourceSchemaFields = getJoinSchemaFields(sourceData.tables);
+    const normalizedSourceRows: AmendedSchemaField[][] = [];
+    for (const { rows, schemaFields: rowSchemaFields } of crossSourceRowsByTable) {
+      normalizedSourceRows.push(
+        ...(sourceSchemaFields.length > 0
+          ? normalizeRowsForJoinSchema(rows, rowSchemaFields, sourceSchemaFields)
+          : rows),
+      );
+    }
+
     // Extract all rows from the indexed data
     const allRightRows: AmendedSchemaField[][] = [];
     for (const rows of indexedData.indexMap.values()) {
       allRightRows.push(...rows);
     }
 
+    const rightSchemaFields =
+      crossJoinRightSchemaFields ?? getJoinSchemaFields([indexedData.sourceTable], allRightRows);
+    const rightRowSchemaFields = indexedData.sourceTable.table.tableSchema?.fields ?? rightSchemaFields;
+    const normalizedRightRows = crossJoinRightSchemaFields
+      ? allRightRows
+      : rightSchemaFields.length > 0
+        ? normalizeRowsForJoinSchema(allRightRows, rightRowSchemaFields, rightSchemaFields)
+        : allRightRows;
+
     hotPathLog(
       executionContext,
-      `Lookup Node ${nodeId}: Cross joining ${sourceRows.length} source rows with ${allRightRows.length} right rows`,
+      `Lookup Node ${nodeId}: Cross joining ${normalizedSourceRows.length} source rows with ${normalizedRightRows.length} right rows`,
     );
 
     const crossJoinedRows: AmendedSchemaField[][] = [];
 
     // Create Cartesian product
-    for (const sourceRow of sourceRows) {
-      for (const rightRow of allRightRows) {
+    for (const sourceRow of normalizedSourceRows) {
+      for (const rightRow of normalizedRightRows) {
         const prefixedSourceRow = sourceRow.map((cell) => ({
           ...cell,
           name: `${sourceTableName}_${cell.name}`,
@@ -3924,24 +4316,20 @@ async function executeLookupNode(
 
     hotPathLog(executionContext, `Lookup Node ${nodeId}: Created ${crossJoinedRows.length} cross-joined rows`);
 
-    // Build schema from the first joined row
-    const schemaFields: DBField[] = [];
-    if (crossJoinedRows.length > 0) {
-      for (const cell of crossJoinedRows[0]) {
-        schemaFields.push({
-          name: cell.name,
-          field_type: cell.type as SCHEMA_FIELD_TYPE,
-          is_key: cell.isKey || false,
-          default_value: "",
-          is_filename: false,
-          is_reference: [],
-          description: `Joined column from cross join`,
-          ca_order: -1,
-          is_bitwise: 0,
-          enum_values: {},
-        });
-      }
-    }
+    const schemaFields: DBField[] = [
+      ...sourceSchemaFields.map((field) => ({
+        ...field,
+        name: `${sourceTableName}_${field.name}`,
+        description: `Source column from cross join`,
+        ca_order: -1,
+      })),
+      ...rightSchemaFields.map((field) => ({
+        ...field,
+        name: `${lookupTableName}_${field.name}`,
+        description: `Indexed column from cross join`,
+        ca_order: -1,
+      })),
+    ];
 
     const schemaVersion = sourceTable.table.tableSchema?.version ?? 1;
     const tableVersion = sourceTable.table.version;
@@ -4133,7 +4521,7 @@ async function executeLookupNode(
 }
 
 async function executeFlattenNestedNode(nodeId: string, inputData: NestedTableSelection): Promise<NodeExecutionResult> {
-  console.log(`Flatten Nested Node ${nodeId}: Processing with input:`, inputData);
+  console.log(`Flatten Nested Node ${nodeId}: Processing`, summarizeFlowInput(inputData));
 
   if (!inputData || inputData.type !== "NestedTableSelection") {
     return { success: false, error: "Invalid input: Expected NestedTableSelection data" };
@@ -4221,7 +4609,7 @@ async function executeExtractTableNode(
   inputData: DBTablesNodeData,
   config?: unknown,
 ): Promise<NodeExecutionResult> {
-  console.log(`Extract Table Node ${nodeId}: Processing with input:`, inputData);
+  console.log(`Extract Table Node ${nodeId}: Processing`, summarizeFlowInput(inputData));
 
   if (!inputData || inputData.type !== "TableSelection") {
     return { success: false, error: "Invalid input: Expected TableSelection data" };
@@ -4327,7 +4715,7 @@ async function executeAggregateNestedNode(
   inputData: NestedTableSelection,
   config?: unknown,
 ): Promise<NodeExecutionResult> {
-  console.log(`Aggregate Nested Node ${nodeId}: Processing with input:`, inputData);
+  console.log(`Aggregate Nested Node ${nodeId}: Processing`, summarizeFlowInput(inputData));
 
   if (!inputData || inputData.type !== "NestedTableSelection") {
     return { success: false, error: "Invalid input: Expected NestedTableSelection data" };
@@ -5685,24 +6073,7 @@ async function executeGenerateRowsNode(
     const outputTable: DBTablesNodeTable = {
       name: outputTableName,
       fileName: sourceTable?.fileName || `db\\${outputTableName}\\generated`,
-      sourceFile:
-        sourceTable?.sourceFile ||
-        ({
-          name: "generated.pack",
-          path: "",
-          packedFiles: [],
-          packHeader: {
-            header: Buffer.alloc(0),
-            byteMask: 0,
-            refFileCount: 0,
-            pack_file_index_size: 0,
-            pack_file_count: 0,
-            header_buffer: Buffer.alloc(0),
-          },
-          lastChangedLocal: 0,
-          size: 0,
-          readTables: [],
-        } as Pack),
+      sourceFile: sourceTable?.sourceFile || ({ name: "generated.pack", path: "" } as PackSource),
       table: sourceTable?.table
         ? {
             ...sourceTable.table,
@@ -6427,7 +6798,7 @@ async function executeGetCounterColumnNode(
   const tableName = selectedTable.startsWith("db\\") ? selectedTable : `db\\${selectedTable}`;
 
   const collectedValues: AmendedSchemaField[] = [];
-  const sourcePacks: Pack[] = [];
+  const sourcePacks: PackSource[] = [];
 
   const packFilesToRead = await narrowFilesToPacksWithTables(
     inputData.files,
@@ -6443,7 +6814,7 @@ async function executeGetCounterColumnNode(
     }
 
     try {
-      const { pack, matchingTablesByName } = await getTableFilesForPackAndTables(
+      const { sourceFile, matchingTablesByName } = await getTableFilesForPackAndTables(
         packFile.path,
         [tableName],
         executionContext,
@@ -6475,7 +6846,7 @@ async function executeGetCounterColumnNode(
       }
 
       if (matchingTables.length > 0) {
-        sourcePacks.push(pack);
+        sourcePacks.push(sourceFile);
       }
     } catch (error) {
       console.error(`GetCounterColumn Node ${nodeId}: Error processing ${packFile.name}:`, error);
@@ -6672,7 +7043,7 @@ async function executeReadTSVFromPackNode(
 
   // Search for TSV file in pack files
   let tsvContent: string | null = null;
-  let sourcePack: Pack | null = null;
+  let sourcePack: PackSource | null = null;
 
   for (const packFile of packFilesToSearch) {
     try {
@@ -6692,12 +7063,12 @@ async function executeReadTSVFromPackNode(
         // TSV files should be stored as text
         if (tsvFile.text) {
           tsvContent = tsvFile.text;
-          sourcePack = pack;
+          sourcePack = { name: pack.name, path: pack.path };
           break;
         } else if (tsvFile.buffer) {
           // If stored as buffer, convert to string
           tsvContent = tsvFile.buffer.toString("utf-8");
-          sourcePack = pack;
+          sourcePack = { name: pack.name, path: pack.path };
           break;
         }
       }
@@ -6832,7 +7203,7 @@ async function executeCustomRowsInputNode(
   inputData: any,
   config?: unknown,
 ): Promise<NodeExecutionResult> {
-  console.log(`CustomRowsInput Node ${nodeId}: Processing with input:`, inputData);
+  console.log(`CustomRowsInput Node ${nodeId}: Processing`, summarizeFlowInput(inputData));
 
   if (!inputData || inputData.type !== "CustomSchema") {
     return { success: false, error: "Invalid input: Expected CustomSchema data" };
@@ -7069,7 +7440,7 @@ async function executeDeepCloneNode(
     for (const searchPack of searchPacksWithTables) {
       if (!searchPack.loaded) continue;
       try {
-        const { pack, matchingTablesByName } = await getTableFilesForPackAndTables(
+        const { sourceFile, matchingTablesByName } = await getTableFilesForPackAndTables(
           searchPack.path,
           searchNames,
           executionContext,
@@ -7081,8 +7452,8 @@ async function executeDeepCloneNode(
             loadedTablesByName.get(bareNames[index])!.push({
               tableName: bareNames[index],
               packedFile,
-              packName: pack.name,
-              packPath: pack.path,
+              packName: sourceFile.name,
+              packPath: sourceFile.path,
             });
           }
         }
@@ -7869,7 +8240,7 @@ async function executeEditTextFileNode(
           outputTables.push({
             name,
             fileName: name,
-            sourceFile: indexedPack,
+            sourceFile: { name: indexedPack.name, path: indexedPack.path },
             table: { name, file_size: editedBuffer.length, start_pos: 0, buffer: editedBuffer } as PackedFile,
             outputFileName: name,
           });
@@ -7904,6 +8275,214 @@ async function executeEditTextFileNode(
     } as DBTablesNodeData,
     warnings: warnings.length > 0 ? warnings : undefined,
   };
+}
+
+const normalizeXmlFilePath = (filePath: string): string => filePath.replace(/[\\/]+/g, "\\").toLowerCase();
+
+const fileNameOfPack = (packPath: string): string => packPath.replace(/^.*[\\/]/, "");
+
+/**
+ * Edits one XML payload selected by a structural locator. File lookup intentionally follows the
+ * same exact-path/winning-pack rules as Edit Text File, but the XML operation itself is delegated
+ * to the dedicated offset-preserving helper rather than the CSS-selector editor.
+ */
+async function executeEditXmlFileNode(
+  nodeId: string,
+  textValue: string,
+  inputData: PackFilesNodeData | DBTablesNodeData,
+  config?: unknown,
+  executionContext?: FlowExecutionContext,
+): Promise<NodeExecutionResult> {
+  if (!inputData || (inputData.type !== "PackFiles" && inputData.type !== "TableSelection")) {
+    return { success: false, error: "Invalid input: Expected PackFiles or TableSelection data" };
+  }
+
+  const parsed = getNodeConfig<Partial<EditXmlFileConfig> & { targetMode?: string; filePath?: string }>(
+    config,
+    textValue,
+  );
+  if (!parsed) return { success: false, error: "Invalid XML node configuration" };
+  if (parsed.targetMode !== "path" && parsed.targetMode !== "input") {
+    return { success: false, error: "Invalid XML file target mode" };
+  }
+  if (typeof parsed.filePath !== "string" || typeof parsed.ignoreHierarchy !== "boolean") {
+    return { success: false, error: "Invalid XML node configuration" };
+  }
+  if (!Array.isArray(parsed.locatorSteps) || !Array.isArray(parsed.attributeEdits)) {
+    return { success: false, error: "Invalid XML node configuration" };
+  }
+  if (parsed.action !== "setAttributes" && parsed.action !== "editAttributes" && parsed.action !== "replaceElement") {
+    return { success: false, error: "Invalid XML action" };
+  }
+  if (typeof parsed.replacementXml !== "string") {
+    return { success: false, error: "Invalid XML replacement configuration" };
+  }
+  if (parsed.targetMode === "path" && !parsed.filePath.trim()) {
+    return { success: false, error: "XML file path is required" };
+  }
+  if (parsed.targetMode === "input" && inputData.type !== "TableSelection") {
+    return { success: false, error: "Previous output requires a TableSelection input" };
+  }
+  if (inputData.type === "PackFiles" && parsed.targetMode !== "path") {
+    return { success: false, error: "PackFiles input requires an exact XML file path" };
+  }
+
+  const xmlConfig: EditXmlFileConfig = {
+    ignoreHierarchy: parsed.ignoreHierarchy,
+    locatorSteps: parsed.locatorSteps as EditXmlFileConfig["locatorSteps"],
+    action: parsed.action,
+    attributeEdits: parsed.attributeEdits as EditXmlFileConfig["attributeEdits"],
+    replacementXml: parsed.replacementXml,
+  };
+
+  const editTable = (inputTable: DBTablesNodeTable): NodeExecutionResult => {
+    const fileName = inputTable.outputFileName || inputTable.name;
+    const inputBuffer = inputTable.table?.buffer;
+    if (!inputBuffer) return { success: false, error: `XML file '${fileName}' has no readable content` };
+    const sourceText = Buffer.from(inputBuffer).toString("utf8");
+    const result = applyEditXmlFile(sourceText, xmlConfig);
+    if (!result.success || result.text === undefined) {
+      return { success: false, error: result.error || `Could not edit XML file '${fileName}'` };
+    }
+    if (result.text === sourceText) {
+      return {
+        success: true,
+        data: {
+          type: "TableSelection",
+          tables: [inputTable],
+          sourceFiles: inputData.type === "TableSelection" ? inputData.sourceFiles || [] : inputData.files || [],
+          tableCount: 1,
+        } as DBTablesNodeData,
+      };
+    }
+    const editedBuffer = Buffer.from(result.text, "utf8");
+    const editedTable: DBTablesNodeTable = {
+      ...inputTable,
+      table: {
+        ...inputTable.table,
+        file_size: editedBuffer.length,
+        buffer: editedBuffer,
+      } as PackedFile,
+      outputFileName: inputTable.outputFileName || fileName,
+    };
+    return {
+      success: true,
+      data: {
+        type: "TableSelection",
+        tables: [editedTable],
+        sourceFiles: inputData.type === "TableSelection" ? inputData.sourceFiles || [] : inputData.files || [],
+        tableCount: 1,
+      } as DBTablesNodeData,
+    };
+  };
+
+  if (inputData.type === "TableSelection") {
+    const tables = inputData.tables || [];
+    const requestedPath = normalizeXmlFilePath(parsed.filePath);
+    const selectedTables =
+      parsed.targetMode === "input"
+        ? tables
+        : tables.filter((table) => normalizeXmlFilePath(table.outputFileName || table.name) === requestedPath);
+    if (selectedTables.length !== 1) {
+      return {
+        success: false,
+        error:
+          parsed.targetMode === "input"
+            ? `Previous output must contain exactly one XML file (found ${selectedTables.length})`
+            : `XML path must match exactly one previous-output file (found ${selectedTables.length})`,
+      };
+    }
+    return editTable(selectedTables[0]);
+  }
+
+  const requestedPath = normalizeXmlFilePath(parsed.filePath);
+  const sourcePackFiles = (inputData.files || []).filter((packFile) => packFile.loaded);
+  if (sourcePackFiles.length === 0) {
+    return { success: false, error: "PackFiles input contains no loaded packs" };
+  }
+
+  const priority = buildFlowPackPriority();
+  const vanillaPackFiles = sourcePackFiles.filter((packFile) => appData.allVanillaPackNames.has(packFile.name));
+  let vanillaIndex: VanillaPackIndex | undefined;
+  if (vanillaPackFiles.length > 0) {
+    try {
+      vanillaIndex = await getVanillaPackIndex();
+    } catch (error) {
+      console.warn(`Edit XML File Node ${nodeId}: could not read vanilla file index:`, error);
+    }
+  }
+
+  const targetedNamesByPack: Array<{ packPath: string; fileNames: string[] }> = [];
+  const originalNamesByPack = new Map<string, string>();
+  const addCandidate = (packPath: string, fileName: string) => {
+    if (!originalNamesByPack.has(packPath)) originalNamesByPack.set(packPath, fileName);
+    else if (normalizeXmlFilePath(originalNamesByPack.get(packPath) as string) !== requestedPath) return;
+    targetedNamesByPack.push({ packPath, fileNames: [requestedPath] });
+  };
+
+  const packWithVanillaName = (packName: string) =>
+    vanillaPackFiles.find(
+      (packFile) =>
+        packFile.name.toLowerCase() === packName.toLowerCase() ||
+        fileNameOfPack(packFile.path).toLowerCase() === packName.toLowerCase(),
+    );
+
+  if (vanillaIndex) {
+    const vanillaPackName = findVanillaPackContaining(vanillaIndex, requestedPath);
+    const vanillaPack = vanillaPackName ? packWithVanillaName(vanillaPackName) : undefined;
+    if (vanillaPack) addCandidate(vanillaPack.path, requestedPath);
+  }
+
+  for (const packFile of sourcePackFiles) {
+    if (vanillaIndex && appData.allVanillaPackNames.has(packFile.name)) continue;
+    try {
+      const indexedPack = await readPackCached(packFile.path, { skipParsingTables: true }, executionContext);
+      const matchingName = indexedPack.packedFiles.find(
+        (packedFile) => normalizeXmlFilePath(packedFile.name) === requestedPath,
+      )?.name;
+      if (matchingName) addCandidate(packFile.path, matchingName);
+    } catch (error) {
+      console.warn(`Edit XML File Node ${nodeId}: could not index ${packFile.path}:`, error);
+    }
+  }
+
+  const winningPackPath = resolveFileSourcePacks(targetedNamesByPack, priority).get(requestedPath);
+  if (!winningPackPath) {
+    return { success: false, error: `No loaded pack contains XML file '${parsed.filePath}'` };
+  }
+
+  try {
+    const requestedName = originalNamesByPack.get(winningPackPath) || requestedPath;
+    const sourcePack = await readPackCached(
+      winningPackPath,
+      { skipParsingTables: true, filesToRead: [requestedName] },
+      executionContext,
+    );
+    const packedFile = sourcePack.packedFiles.find(
+      (candidate) => normalizeXmlFilePath(candidate.name) === requestedPath && candidate.buffer,
+    );
+    if (!packedFile?.buffer) {
+      return { success: false, error: `XML file '${parsed.filePath}' could not be read from its winning pack` };
+    }
+    const sourcePackFile = sourcePackFiles.find((packFile) => packFile.path === winningPackPath);
+    const fileName = packedFile.name;
+    const inputTable: DBTablesNodeTable = {
+      name: fileName,
+      fileName,
+      sourceFile: {
+        name: sourcePackFile?.name || sourcePack.name,
+        path: sourcePackFile?.path || winningPackPath,
+      },
+      table: packedFile,
+      outputFileName: fileName,
+    };
+    return editTable(inputTable);
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : `Could not read XML file '${parsed.filePath}'`,
+    };
+  }
 }
 
 /**
@@ -8045,7 +8624,7 @@ async function executePackFileOperationsNode(
         outputTables.push({
           name: copy.targetPath,
           fileName: copy.targetPath,
-          sourceFile: indexedPack,
+          sourceFile: { name: indexedPack.name, path: indexedPack.path },
           table: {
             name: copy.targetPath,
             file_size: buffer.length,

@@ -200,6 +200,15 @@ export interface SettlementTypeBinding {
   exclude: boolean;
 }
 
+/** One `campaign_building_chain_slot_unlocks` row in the current WH3 schema. */
+export interface CampaignBuildingChainSlotUnlock {
+  buildingChain: string;
+  /** The level of the primary building chain this row applies to. */
+  level: number;
+  /** Total active settlement slots at that primary level, including the primary slot. */
+  activeSlotCount: number;
+}
+
 export interface BuildingEffectRow {
   building: string;
   effectKey: string;
@@ -263,6 +272,8 @@ export interface BuiltBuildingsData {
   availabilitySetsByChain: Record<string, string[]>;
   availabilitiesBySetId: Record<string, AvailabilityRow[]>;
   settlementTypeBindings: Record<string, SettlementTypeBinding[]>;
+  /** Effective slot count rows, keyed by primary building chain. */
+  campaignBuildingChainSlotUnlocksByChain: Record<string, CampaignBuildingChainSlotUnlock[]>;
   upgrades: Array<{ from: string; to: string }>;
   effectsByLevel: Record<string, BuildingEffectRow[]>;
   /** Expanded unit rows per armed-citizenry group, retained so pending junctions can update the board. */
@@ -383,6 +394,8 @@ export interface BuildingsRegionQuery {
   culture?: string;
   subculture?: string;
   faction?: string;
+  /** The imported extended-map primary building, used to resolve active slot count. */
+  primaryBuilding?: string;
   includeHiddenInUi?: boolean;
   includeHiddenSets?: boolean;
   includeLevelsWithoutVariant?: boolean;
@@ -397,6 +410,8 @@ export interface BuildingsRegionQuery {
 export interface BuildingsTile {
   levelKey: string;
   chainKey: string;
+  /** The `building_chains_tables.building_superchain` key for this level's chain. */
+  superChainKey?: string;
   setKey: string;
   /** Pack containing the effective culture-variant row used by this tile. */
   cloneSourcePackPath?: string;
@@ -447,6 +462,10 @@ export interface BuildingsTile {
   isSettlementOrPort: boolean;
   isDuplicatedAcrossSets: boolean;
   isForeignSlot: boolean;
+  /** Slot types that expose this chain in the current board. Used by the extended map editor. */
+  slotTypes?: string[];
+  /** Slot templates that expose this chain in the current board. Used to keep resource slots exact. */
+  slotTemplates?: string[];
 }
 
 export interface BuildingsChainColumn {
@@ -504,6 +523,8 @@ export interface BuildingsRegionView {
   /** Levels placed in this region by the campaign's start pos. */
   existingBuildings: string[];
   slotTemplates: RegionSlot[];
+  /** Maximum active settlement slots for the queried primary building, when available. */
+  maxSlotCount?: number;
 }
 
 // ---------------------------------------------------------------------------

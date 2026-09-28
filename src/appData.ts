@@ -161,6 +161,10 @@ interface AppData {
   isMakeUnitsGeneralsEnabled: boolean;
   isFeaturesForModdersEnabled: boolean;
   moddersPrefix: string;
+  /** Include eligible .rigid_model_v2 files when compressing packs from the analysis panel. */
+  isRigidModelV2CompressionEnabled: boolean;
+  /** Compress mod packs in place before updating them on the Steam Workshop. */
+  compressModsOnUpload: boolean;
   isShowingSkillNodeSetNames: boolean;
   hideRepeatedKeyPrefixes: boolean;
   isShowingHiddenSkills: boolean;
@@ -172,6 +176,8 @@ interface AppData {
   packsData: Pack[];
   unsavedPacksData: Record<string, PackedFile[]>;
   deletedPackFilePaths: Record<string, string[]>;
+  /** Physical packs most recently opened in the mod viewer, newest first. */
+  recentPackPaths: string[];
   compatData: PackCollisions;
   vanillaPacks: Pack[];
   allVanillaPackNames: Set<string>;
@@ -179,8 +185,17 @@ interface AppData {
   outdatedPackFiles: Record<string, string[]>;
   enabledMods: Mod[];
   allMods: Mod[];
+  /** Pack name -> the rules that pack ships inside itself, from the last mod scan. */
+  modLoadOrderRules: Record<string, LoadOrderRule[]>;
+  /** The current game's rules, mirrored from the last config payload the renderer sent. */
+  loadOrderRules: LoadOrderRule[];
+  disabledModLoadOrderRules: string[];
+  loadOrderRuleDisabledPacks: string[];
   startArgs: string[];
   isAdmin: boolean;
+  canCreateSymbolicLinks: boolean;
+  workshopStagingCleanupPending: boolean;
+  workshopStagingCleanupGamePath?: string;
   gameUpdates: GameUpdateData[];
   isWH3Running: boolean;
   currentGame: SupportedGames;
@@ -230,6 +245,8 @@ const appData = {
   isMakeUnitsGeneralsEnabled: false,
   isFeaturesForModdersEnabled: false,
   moddersPrefix: "",
+  isRigidModelV2CompressionEnabled: true,
+  compressModsOnUpload: true,
   isShowingSkillNodeSetNames: false,
   hideRepeatedKeyPrefixes: true,
   isShowingHiddenSkills: true,
@@ -241,6 +258,7 @@ const appData = {
   packsData: [],
   unsavedPacksData: {},
   deletedPackFilePaths: {},
+  recentPackPaths: [],
   compatData: {
     packTableCollisions: [],
     packFileCollisions: [],
@@ -254,8 +272,15 @@ const appData = {
   outdatedPackFiles: {},
   enabledMods: [],
   allMods: [],
+  modLoadOrderRules: {},
+  loadOrderRules: [],
+  disabledModLoadOrderRules: [],
+  loadOrderRuleDisabledPacks: [],
   startArgs: [],
   isAdmin: false,
+  canCreateSymbolicLinks: false,
+  workshopStagingCleanupPending: false,
+  workshopStagingCleanupGamePath: undefined,
   gameUpdates: [],
   isWH3Running: false,
   currentGame: "wh3",

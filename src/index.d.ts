@@ -11,6 +11,34 @@ declare global {
   }
 
   type VanillaDbCacheBuildProgress = import("./vanillaDbCache/progress").VanillaDbCacheBuildProgress;
+  type CompressionAnalysisProgress = import("./compressionAnalysis").CompressionAnalysisProgress;
+  type CompressionAnalysisRequest = import("./compressionAnalysis").CompressionAnalysisRequest;
+  type CompressionAnalysisResult = import("./compressionAnalysis").CompressionAnalysisResult;
+  type CompressionAnalysisStartResponse = import("./compressionAnalysis").CompressionAnalysisStartResponse;
+  type CompressPackRequest = import("./compressionAnalysis").CompressPackRequest;
+  type CompressPackResponse = import("./compressionAnalysis").CompressPackResponse;
+  type WorkshopStagingProgress = import("./utility/workshopModStaging").WorkshopStagingProgress;
+  type WorkshopStagingProgressPhase = import("./utility/workshopModStaging").WorkshopStagingProgressPhase;
+
+  type WorkshopModStagingProgressStatus = "running" | "canceling" | "cancelled" | "complete" | "failed";
+
+  /** Progress envelope sent to the renderer for one Workshop-aware game-start request. */
+  interface WorkshopModStagingProgressEvent {
+    runId: string;
+    status: WorkshopModStagingProgressStatus;
+    stage: string;
+    percent?: number;
+    completedMods?: number;
+    totalMods?: number;
+    bytesCopied?: number;
+    totalBytes?: number;
+    fileIndex?: number;
+    fileCount?: number;
+    currentMod?: string;
+    currentFile?: string;
+    detail?: string;
+    error?: string;
+  }
 
   type DiagnosticPathTarget = "appLogFile" | "appLogsFolder" | "latestGameScriptLog";
 
@@ -18,6 +46,21 @@ declare global {
     success: boolean;
     path?: string;
     error?: string;
+  }
+
+  type LoadOrderRule = import("./loadOrderRules").LoadOrderRule;
+  type LoadOrderEdges = import("./loadOrderRules").LoadOrderEdges;
+  type LoadOrderRuleConflict = import("./loadOrderRules").LoadOrderRuleConflict;
+
+  /**
+   * What resolving the rules produced, minus the edge map, which holds Sets and so cannot live in
+   * redux. Components rebuild the map from `rules` with buildLoadOrderEdges.
+   */
+  interface LoadOrderRulesResolution {
+    rules: LoadOrderRule[];
+    conflicts: LoadOrderRuleConflict[];
+    disabledRules: LoadOrderRule[];
+    supersededRules: LoadOrderRule[];
   }
 
   type MergedModsData = {
@@ -86,6 +129,10 @@ declare global {
     path: string;
     isMovie: boolean;
     hasStartpos: boolean;
+    /** Whether the pack ships its own whmm\load_order.whmm, spotted during the header's index walk. */
+    hasLoadOrderRules?: boolean;
+    /** That file's name as the pack spells it, which is what a targeted read has to ask for. */
+    loadOrderRulesFileName?: string;
     dependencyPacks: string[];
   }
 
@@ -188,6 +235,9 @@ declare global {
     lastModThatWasRead: ModReadingInfo | undefined;
     currentlyReadingMod: ModReadingInfo | undefined;
     isClosedOnPlay: boolean;
+    workshopModStagingMode: WorkshopModStagingMode;
+    compressWorkshopModsOnStart: boolean;
+    cleanUpWorkshopModStagingAfterGameExit: boolean;
     /** Read the game's English locs even when the app is set to another language. */
     isUsingEnglishLocalizations: boolean;
     isCompatCheckingVanillaPacks: boolean;
@@ -217,6 +267,7 @@ declare global {
     areCategoryThumbnailsEnabled: boolean;
     isDev: boolean;
     isAdmin: boolean;
+    canCreateSymbolicLinks: boolean;
     startArgs: string[];
     isMakeUnitsGeneralsEnabled: boolean;
     isScriptLoggingEnabled: boolean;
@@ -225,12 +276,18 @@ declare global {
     isChangingGameProcessPriority: boolean;
     isFeaturesForModdersEnabled: boolean;
     moddersPrefix: string;
+    /** Include eligible .rigid_model_v2 files when compressing packs from the analysis panel. */
+    isRigidModelV2CompressionEnabled: boolean;
+    /** Compress mod packs in place before updating them on the Steam Workshop. */
+    compressModsOnUpload: boolean;
     allMods: Mod[];
     workshopInstallStatuses: Record<string, WorkshopInstallStatus>;
     workshopUpdateCheckResults: Record<string, WorkshopUpdateCheckItem>;
     packsData: Record<string, PackViewData>;
     unsavedPacksData: Record<string, PackedFile[]>;
     deletedPackFilePaths: Record<string, string[]>;
+    /** Physical packs most recently opened in the mod viewer, newest first. */
+    recentPackPaths: string[];
     packCollisions: PackCollisions;
     packCollisionsCheckProgress: PackCollisionsCheckProgressData;
     dataFromConfig?: ConfigForRenderer;
@@ -249,6 +306,14 @@ declare global {
     /** Bumped to make the node editor re-read the open flow when the selection itself cannot change. */
     currentFlowFileReloadNonce: number;
     currentTab: MainWindowTab;
+    /** Ordering rules the user made, for the current game. */
+    loadOrderRules: LoadOrderRule[];
+    disabledModLoadOrderRules: string[];
+    loadOrderRuleDisabledPacks: string[];
+    /** Pack name -> the rules that pack ships inside itself. Rebuilt by each mod scan. */
+    modLoadOrderRules: Record<string, LoadOrderRule[]>;
+    /** Derived from the four above; never persisted. */
+    loadOrderRulesResolution: LoadOrderRulesResolution;
     /**
      * Left sidebar tabs the user has hidden. All Mods can never be in here: it is what the current
      * tab falls back to. Skill Trees and Tech Trees are steered by the tree display modes instead.
@@ -258,6 +323,14 @@ declare global {
     isVisualsSortByCultureEnabled: boolean;
     /** Hide repeated variant files in the Visuals Lord and Hero culture groups. */
     isVisualsHideDuplicatesEnabled: boolean;
+    /** Whether the Unit Viewer shows one unit for visualization or multiple units for comparison. */
+    unitViewerMode: UnitViewerMode;
+    /** Whether the Unit Viewer shows the render wireframe beneath the unit visualization. */
+    unitViewerShowWireframe: boolean;
+    /** Whether the Unit Viewer starts comparison animations at independent points in their cycles. */
+    unitViewerUnsyncedAnimations: boolean;
+    /** Whether the Unit Viewer shows the unit card alongside the visualization. */
+    unitViewerShowUnitCard: boolean;
     mapCampaignName: string;
     mapSelectedRegion?: MapRegionSelection;
     isCreateSteamCollectionOpen: boolean;
@@ -319,6 +392,10 @@ declare global {
 
   type ModListDensity = "compact" | "comfortable" | "roomy";
 
+  type UnitViewerMode = "visualize" | "compare";
+
+  type WorkshopModStagingMode = import("./utility/workshopModStaging").WorkshopModStagingMode;
+
   type SkillsViewOptions = Pick<
     AppState,
     | "isShowingSkillNodeSetNames"
@@ -349,7 +426,12 @@ declare global {
     | "isChangingGameProcessPriority"
     | "isFeaturesForModdersEnabled"
     | "moddersPrefix"
+    | "isRigidModelV2CompressionEnabled"
+    | "compressModsOnUpload"
     | "isClosedOnPlay"
+    | "workshopModStagingMode"
+    | "compressWorkshopModsOnStart"
+    | "cleanUpWorkshopModStagingAfterGameExit"
     | "isUsingEnglishLocalizations"
     | "categories"
     | "categoryColors"
@@ -371,6 +453,11 @@ declare global {
     | "hiddenMainWindowTabs"
     | "isVisualsSortByCultureEnabled"
     | "isVisualsHideDuplicatesEnabled"
+    | "unitViewerMode"
+    | "unitViewerShowWireframe"
+    | "unitViewerUnsyncedAnimations"
+    | "unitViewerShowUnitCard"
+    | "recentPackPaths"
   >;
 
   /** Everything stored for one game. Per-mod data lives in modUserData, one copy, not once per preset. */
@@ -380,6 +467,15 @@ declare global {
     presets: SavedPreset[];
     /** Mod name -> data. */
     modUserData: Record<string, StoredModUserData>;
+    /**
+     * Ordering rules the user made. Per game rather than global because a pack name only means
+     * something within one game.
+     */
+    loadOrderRules: LoadOrderRule[];
+    /** Canonical keys of individual mod-supplied rules the user switched off. */
+    disabledModLoadOrderRules: string[];
+    /** Packs whose own rules the user ignores wholesale, including any they add later. */
+    loadOrderRuleDisabledPacks: string[];
   }
 
   /** The config.json document. */
@@ -419,7 +515,15 @@ declare global {
   >;
 
   type StartGameOptions = StartGameSpecificOptions &
-    Pick<AppState, "isClosedOnPlay" | "packDataOverwrites" | "userFlowOptions">;
+    Pick<
+      AppState,
+      | "isClosedOnPlay"
+      | "workshopModStagingMode"
+      | "compressWorkshopModsOnStart"
+      | "cleanUpWorkshopModStagingAfterGameExit"
+      | "packDataOverwrites"
+      | "userFlowOptions"
+    >;
 
   interface SetCurrentGamePayload {
     game: SupportedGames;
@@ -535,6 +639,7 @@ declare global {
 
   interface FlowExecutionContext {
     readPackCache: Map<string, Promise<Pack>>;
+    packIndexCache: Map<string, Promise<import("./utility/compactPackIndex").CompactPackIndex>>;
     tableFilesByPackAndTable: Map<string, PackedFile[]>;
     rowsByPackedFile: WeakMap<PackedFile, AmendedSchemaField[][]>;
     columnIndexesByPackedFile: WeakMap<PackedFile, Map<string, number>>;
@@ -1176,6 +1281,7 @@ declare global {
     | "ancillaries"
     | "map"
     | "nodeEditor"
+    | "loadOrderRules"
     | "presets";
 
   export interface WorkshopItemStatisticStringified {
@@ -1439,6 +1545,7 @@ declare global {
     | "removetables"
     | "editloctext"
     | "edittextfile"
+    | "editxmlfile"
     | "packfileoperations";
 
   // FlowNodeData = "string"|
@@ -1497,10 +1604,15 @@ declare global {
     loadedCount: number;
   }
 
+  interface PackSource {
+    name: string;
+    path: string;
+  }
+
   interface DBTablesNodeTable {
     name: string;
     fileName: string;
-    sourceFile: Pack;
+    sourceFile: PackSource;
     table: PackedFile;
     /**
      * Overrides the default `db\<tableName>\` output folder when this table is written by the save
@@ -1539,7 +1651,7 @@ declare global {
   interface DBColumnSelectionTableValues {
     tableName: string;
     fileName: string;
-    sourcePack: Pack;
+    sourcePack: PackSource;
     sourceTable: PackedFile;
     selectedColumns: string[];
     data: { col: string; data: string }[];

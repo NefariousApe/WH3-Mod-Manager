@@ -2,7 +2,7 @@ import * as nodePath from "path";
 import * as fs from "fs";
 
 /** Bump whenever the extraction rules or the cached shape change. */
-export const VISUALS_DATA_CACHE_VERSION = 4;
+export const VISUALS_DATA_CACHE_VERSION = 7;
 /** Subfolder under `app.getPath("userData")`, so the two files stay together. */
 export const VISUALS_CACHE_DIR = "visuals";
 const VANILLA_CACHE_FILE = "vanilla.bin";
@@ -11,16 +11,29 @@ const MODS_CACHE_FILE = "mods.bin";
 /** Keep the mod cache bounded while retaining disabled mods for quick re-enabling. */
 const MOD_SEGMENT_CAP = 100;
 
-export type VisualsFileExtension = "variantmeshdefinition" | "wsmodel" | "rigid_model_v2";
+export type VisualsFileExtension = "variantmeshdefinition" | "wsmodel" | "rigid_model_v2" | "xml.material" | "dds";
 
 export interface VisualsFileResult {
   path: string;
   ext: VisualsFileExtension;
 }
 
+export type VisualsVariantDetails = {
+  techFolder: string;
+  variantFilename: string;
+  lowPolyFilename: string;
+  mountScale: string;
+  scale: string;
+  scaleVariation: string;
+  superLowPolyFilename: string;
+};
+
 export interface VisualsTableContribution {
   variants: Array<[variantName: string, variantFilename: string]>;
-  unitVariants: Array<[unitKey: string, faction: string, variantName: string]>;
+  variantDetails?: Array<[variantName: string, details: VisualsVariantDetails]>;
+  unitVariants: Array<
+    [unitKey: string, faction: string, variantName: string, name?: string, unitCard?: string]
+  >;
   landUnits: string[];
   /** Land-unit caste metadata from main_units, kept optional for callers constructing old fixtures. */
   mainUnits?: Array<[landUnitKey: string, caste: string]>;
@@ -36,7 +49,11 @@ export interface VisualsTableContribution {
 
 export interface VisualsMergedTableData {
   variantsByName: Map<string, string>;
-  unitToVariantRows: Map<string, Array<{ faction: string; variantName: string }>>;
+  variantDetailsByName: Map<string, VisualsVariantDetails>;
+  unitToVariantRows: Map<
+    string,
+    Array<{ faction: string; variantName: string; name: string; unitCard: string }>
+  >;
   landUnitKeys: Set<string>;
   unitKeyToOriginPackPath: Map<string, string>;
   unitKeyToCaste: Map<string, string>;
@@ -301,9 +318,11 @@ export const getCurrentVisualsTableContribution = (
 
 export const getVisualsFileExtension = (fileName: string): VisualsFileExtension | undefined => {
   const normalizedName = fileName.toLowerCase();
+  if (normalizedName.endsWith(".xml.material")) return "xml.material";
   if (normalizedName.endsWith(".variantmeshdefinition")) return "variantmeshdefinition";
   if (normalizedName.endsWith(".wsmodel")) return "wsmodel";
   if (normalizedName.endsWith(".rigid_model_v2")) return "rigid_model_v2";
+  if (normalizedName.endsWith(".dds")) return "dds";
   return undefined;
 };
 
@@ -336,7 +355,11 @@ export const mergeVisualsTableContributions = (
   originOrder: Array<{ packPath: string; contribution: VisualsTableContribution }>,
 ): VisualsMergedTableData => {
   const variantsByName = new Map<string, string>();
-  const unitToVariantRows = new Map<string, Array<{ faction: string; variantName: string }>>();
+  const variantDetailsByName = new Map<string, VisualsVariantDetails>();
+  const unitToVariantRows = new Map<
+    string,
+    Array<{ faction: string; variantName: string; name: string; unitCard: string }>
+  >();
   const landUnitKeys = new Set<string>();
   const unitKeyToOriginPackPath = new Map<string, string>();
   const unitKeyToCaste = new Map<string, string>();
@@ -349,10 +372,13 @@ export const mergeVisualsTableContributions = (
     for (const [variantName, variantFilename] of contribution.variants) {
       variantsByName.set(variantName, variantFilename);
     }
-    for (const [unitKey, faction, variantName] of contribution.unitVariants) {
+    for (const [variantName, details] of contribution.variantDetails || []) {
+      variantDetailsByName.set(variantName, details);
+    }
+    for (const [unitKey, faction, variantName, name = "", unitCard = ""] of contribution.unitVariants) {
       const rows = unitToVariantRows.get(unitKey) || [];
       const existingIndex = rows.findIndex((row) => row.faction === faction);
-      const nextRow = { faction, variantName };
+      const nextRow = { faction, variantName, name, unitCard };
       if (existingIndex >= 0) rows.splice(existingIndex, 1, nextRow);
       else rows.push(nextRow);
       unitToVariantRows.set(unitKey, rows);
@@ -385,6 +411,7 @@ export const mergeVisualsTableContributions = (
 
   return {
     variantsByName,
+    variantDetailsByName,
     unitToVariantRows,
     landUnitKeys,
     unitKeyToOriginPackPath,

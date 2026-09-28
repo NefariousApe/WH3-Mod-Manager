@@ -142,14 +142,33 @@ describe("migrateAppConfig", () => {
     expect(config.currentGame).toBe("wh3");
     expect(config.isVisualsSortByCultureEnabled).toBe(true);
     expect(config.isVisualsHideDuplicatesEnabled).toBe(true);
+    expect(config.unitViewerMode).toBe("visualize");
+    expect(config.unitViewerShowWireframe).toBe(true);
+    expect(config.unitViewerUnsyncedAnimations).toBe(true);
+    expect(config.unitViewerShowUnitCard).toBe(true);
     expect(config.hideRepeatedKeyPrefixes).toBe(true);
+    expect(config.recentPackPaths).toEqual([]);
     expect(config.games.rome2).toEqual({
       currentPreset: { name: "", mods: [], version: 2 },
       presets: [],
       modUserData: {},
+      // Load order rules are per game, so an untouched game starts with none of each kind.
+      loadOrderRules: [],
+      disabledModLoadOrderRules: [],
+      loadOrderRuleDisabledPacks: [],
     });
     expect(config.gameFolderPaths.rome2.modSourceOrder).toEqual(["data", "workshop"]);
     expect(config.alwaysEnabledModNames).toEqual([]);
+  });
+
+  it("filters vanilla and duplicate recent viewer packs while migrating", () => {
+    const config = migrateAppConfig({
+      configVersion: CONFIG_VERSION,
+      currentGame: "wh3",
+      recentPackPaths: ["/mods/db.pack", "C:\\Mods\\Example.pack", "c:/mods/example.pack"],
+    });
+
+    expect(config.recentPackPaths).toEqual(["C:\\Mods\\Example.pack"]);
   });
 
   it("preserves the Visuals culture sort option", () => {
@@ -161,6 +180,42 @@ describe("migrateAppConfig", () => {
 
     expect(config.isVisualsSortByCultureEnabled).toBe(true);
     expect(config.isVisualsHideDuplicatesEnabled).toBe(false);
+  });
+
+  it("preserves the Unit Viewer mode", () => {
+    const config = migrateAppConfig({
+      ...createLegacyConfig(),
+      unitViewerMode: "compare",
+    });
+
+    expect(config.unitViewerMode).toBe("compare");
+  });
+
+  it("preserves the Unit Viewer wireframe option", () => {
+    const config = migrateAppConfig({
+      ...createLegacyConfig(),
+      unitViewerShowWireframe: false,
+    });
+
+    expect(config.unitViewerShowWireframe).toBe(false);
+  });
+
+  it("preserves the Unit Viewer unsynced animations option", () => {
+    const config = migrateAppConfig({
+      ...createLegacyConfig(),
+      unitViewerUnsyncedAnimations: false,
+    });
+
+    expect(config.unitViewerUnsyncedAnimations).toBe(false);
+  });
+
+  it("preserves the Unit Viewer card option", () => {
+    const config = migrateAppConfig({
+      ...createLegacyConfig(),
+      unitViewerShowUnitCard: false,
+    });
+
+    expect(config.unitViewerShowUnitCard).toBe(false);
   });
 
   it("is idempotent and leaves an already-migrated config alone", () => {

@@ -9,6 +9,7 @@ import type {
   UnitViewerCatalogResponse,
   UnitViewerDetailsResponse,
 } from "./unitViewer/types";
+import type { VariantMeshCatalogResponse } from "./visuals/variantMesh";
 import type {
   BuildingsCaiRowsResponse,
   BuildingsCatalogResponse,
@@ -27,12 +28,33 @@ import type {
 import type { EsfMapResponse } from "./esfMap/types";
 import type { PackRowsForSave } from "./utility/packRowsForSave";
 import type { PackFileRenameEntry } from "./utility/packFileRenamePlan";
+import type {
+  CompressionAnalysisProgress,
+  CompressionAnalysisRequest,
+  CompressionAnalysisStartResponse,
+  CompressPackRequest,
+  CompressPackResponse,
+} from "./compressionAnalysis";
+import type { Wh3AssetHostDecisionAction, Wh3AssetHostDecisionRequest } from "./wh3AssetHostClient";
 
-console.log("IN PRELOAD");
+const createWorkshopStagingRunId = (): string => {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  } catch {
+    // Fall through to the local fallback for older Electron runtimes.
+  }
+  return `workshop-${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+};
 
 const api = {
-  startGame: (mods: Mod[], areModsInOrder: boolean, startGameOptions: StartGameOptions, name?: string) =>
-    ipcRenderer.send("startGame", mods, areModsInOrder, startGameOptions, name),
+  startGame: (mods: Mod[], areModsInOrder: boolean, startGameOptions: StartGameOptions, name?: string) => {
+    const usesWorkshopStaging =
+      startGameOptions.workshopModStagingMode === "copy" || startGameOptions.workshopModStagingMode === "symlink";
+    const runId = usesWorkshopStaging ? createWorkshopStagingRunId() : undefined;
+    if (runId) ipcRenderer.send("startGame", mods, areModsInOrder, startGameOptions, name, runId);
+    else ipcRenderer.send("startGame", mods, areModsInOrder, startGameOptions, name);
+    return runId;
+  },
   exportModsToClipboard: (mods: Mod[], availableMods: Mod[]) =>
     ipcRenderer.send("exportModsToClipboard", mods, availableMods),
   exportModNamesToClipboard: (mods: Mod[]) => ipcRenderer.send("exportModNamesToClipboard", mods),
@@ -67,6 +89,11 @@ const api = {
   requestSaves: () => ipcRenderer.send("requestSaves"),
   putPathInClipboard: (path: string) => ipcRenderer.send("putPathInClipboard", path),
   copyModToData: (path: string) => ipcRenderer.send("copyModToData", path),
+  compareModsByteForByte: (
+    modPath: string,
+    workshopModPath: string,
+  ): Promise<{ success: boolean; identical?: boolean; error?: string }> =>
+    ipcRenderer.invoke("compareModsByteForByte", modPath, workshopModPath),
   updateMod: (mod: Mod, contentMod: Mod) => ipcRenderer.send("updateMod", mod, contentMod),
   uploadMod: (mod: Mod) => ipcRenderer.send("uploadMod", mod),
   fakeUpdatePack: (mod: Mod) => ipcRenderer.send("fakeUpdatePack", mod),
@@ -97,6 +124,8 @@ const api = {
     ipcRenderer.on("setIsDev", callback),
   setIsAdmin: (callback: (event: Electron.IpcRendererEvent, isAdmin: boolean) => void) =>
     ipcRenderer.on("setIsAdmin", callback),
+  setCanCreateSymbolicLinks: (callback: (event: Electron.IpcRendererEvent, canCreate: boolean) => void) =>
+    ipcRenderer.on("setCanCreateSymbolicLinks", callback),
   setIsWH3Running: (callback: (event: Electron.IpcRendererEvent, isWH3Running: boolean) => void) =>
     ipcRenderer.on("setIsWH3Running", callback),
   setStartArgs: (callback: (event: Electron.IpcRendererEvent, startArgs: string[]) => void) =>
@@ -127,8 +156,38 @@ const api = {
   copyToDataAsSymbolicLink: (modPathsToCopy?: string[]) => ipcRenderer.send("copyToDataAsSymbolicLink", modPathsToCopy),
   cleanData: () => ipcRenderer.send("cleanData"),
   cleanSymbolicLinksInData: () => ipcRenderer.send("cleanSymbolicLinksInData"),
+  getWorkshopModStagingInfo: (): Promise<{
+    success: boolean;
+    size?: number;
+    hasContents?: boolean;
+    error?: string;
+  }> => ipcRenderer.invoke("getWorkshopModStagingInfo"),
+  clearWorkshopModStaging: (): Promise<{
+    success: boolean;
+    removed?: boolean;
+    code?: "GAME_RUNNING" | "CLEANUP_FAILED";
+    error?: string;
+  }> => ipcRenderer.invoke("clearWorkshopModStaging"),
   getPackData: (packPath: string, table?: DBTable) => ipcRenderer.send("getPackData", packPath, table),
   getPackDataWithLocs: (packPath: string, table?: DBTable) => ipcRenderer.send("getPackDataWithLocs", packPath, table),
+  getVanillaPackFileTree: (
+    packPath: string,
+    prefix: string,
+  ): Promise<{
+    success: boolean;
+    children?: { path: string; isBranch: boolean }[];
+    error?: string;
+  }> => ipcRenderer.invoke("getVanillaPackFileTree", packPath, prefix),
+  searchVanillaPackFiles: (
+    packPath: string,
+    query: string,
+  ): Promise<{
+    success: boolean;
+    filePaths?: string[];
+    folderPaths?: string[];
+    truncated?: boolean;
+    error?: string;
+  }> => ipcRenderer.invoke("searchVanillaPackFiles", packPath, query),
   saveConfig: (payload: ConfigSavePayload) => ipcRenderer.send("saveConfig", payload),
   readMods: debounce(
     (mods: Mod[], skipCollisionCheck = true, canUseCustomizableCache = true, customizableModsHash?: string) =>
@@ -143,6 +202,24 @@ const api = {
     ipcRenderer.invoke("translateAll", translationIdsWithOptions),
   translateAllStatic: (translationIds: Record<string, string | number>) =>
     ipcRenderer.invoke("translateAllStatic", translationIds),
+  startCompressionAnalysis: (request: CompressionAnalysisRequest): Promise<CompressionAnalysisStartResponse> =>
+    ipcRenderer.invoke("startCompressionAnalysis", request),
+  compressPack: (request: CompressPackRequest): Promise<CompressPackResponse> =>
+    ipcRenderer.invoke("compressPack", request),
+  cancelCompressionAnalysis: () => ipcRenderer.send("cancelCompressionAnalysis"),
+  cancelWorkshopModStaging: (runId?: string) => ipcRenderer.send("cancelWorkshopModStaging", runId),
+  onWorkshopModStagingProgress: (
+    callback: (event: Electron.IpcRendererEvent, progress: WorkshopModStagingProgressEvent) => void,
+  ) => {
+    ipcRenderer.on("workshopModStagingProgress", callback);
+    return () => ipcRenderer.removeListener("workshopModStagingProgress", callback);
+  },
+  onCompressionAnalysisProgress: (
+    callback: (event: Electron.IpcRendererEvent, progress: CompressionAnalysisProgress) => void,
+  ) => {
+    ipcRenderer.on("compressionAnalysisProgress", callback);
+    return () => ipcRenderer.removeListener("compressionAnalysisProgress", callback);
+  },
   fromAppConfig: (callback: (event: Electron.IpcRendererEvent, config: ConfigForRenderer) => void) =>
     ipcRenderer.on("fromAppConfig", callback),
   failedReadingConfig: (callback: (event: Electron.IpcRendererEvent) => void) =>
@@ -158,11 +235,13 @@ const api = {
     ipcRenderer.on("setModData", callback),
   setPackHeaderData: (callback: (event: Electron.IpcRendererEvent, packHeaderData: PackHeaderData[]) => void) =>
     ipcRenderer.on("setPackHeaderData", callback),
+  setModLoadOrderRules: (
+    callback: (event: Electron.IpcRendererEvent, modLoadOrderRules: Record<string, LoadOrderRule[]>) => void,
+  ) => ipcRenderer.on("setModLoadOrderRules", callback),
   setPacksData: (callback: (event: Electron.IpcRendererEvent, packsData: PackViewData[]) => void) =>
     ipcRenderer.on("setPacksData", callback),
-  applySavedPackData: (
-    callback: (event: Electron.IpcRendererEvent, payload: ApplySavedPackDataPayload) => void,
-  ) => ipcRenderer.on("applySavedPackData", callback),
+  applySavedPackData: (callback: (event: Electron.IpcRendererEvent, payload: ApplySavedPackDataPayload) => void) =>
+    ipcRenderer.on("applySavedPackData", callback),
   setUnsavedPacksData: (
     callback: (event: Electron.IpcRendererEvent, packPath: string, unsavedFileData: PackedFile[]) => void,
   ) => ipcRenderer.on("setUnsavedPacksData", callback),
@@ -403,6 +482,8 @@ const api = {
       humanName?: string;
       isEnabled: boolean;
       isInData: boolean;
+      /** Lower values are the sources chosen first for same-named mods. */
+      priority?: number;
     }>;
     error?: string;
   }> => ipcRenderer.invoke("getViewerPackCatalog"),
@@ -566,6 +647,33 @@ const api = {
   getUnitViewerDetails: (sessionId: string, unitKey: string): Promise<UnitViewerDetailsResponse> =>
     ipcRenderer.invoke("getUnitViewerDetails", sessionId, unitKey),
 
+  getUnitViewerVariantMeshCatalog: (sessionId: string, assetPath: string): Promise<VariantMeshCatalogResponse> =>
+    ipcRenderer.invoke("getUnitViewerVariantMeshCatalog", sessionId, assetPath),
+
+  getVisualsVariantMeshCatalog: (sessionId: string, assetPath: string): Promise<VariantMeshCatalogResponse> =>
+    ipcRenderer.invoke("getVisualsVariantMeshCatalog", sessionId, assetPath),
+
+  onWh3AssetHostDecisionRequest: (
+    callback: (event: Electron.IpcRendererEvent, request: Wh3AssetHostDecisionRequest) => void,
+  ) => {
+    ipcRenderer.on("wh3AssetHostDecisionRequest", callback);
+    return () => ipcRenderer.removeListener("wh3AssetHostDecisionRequest", callback);
+  },
+
+  respondWh3AssetHostDecision: (
+    requestId: string,
+    action: Wh3AssetHostDecisionAction,
+  ): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke("respondWh3AssetHostDecision", requestId, action),
+
+  startWh3AssetHost: (): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke("startWh3AssetHost"),
+  stopWh3AssetHost: (): Promise<{ success: boolean }> => ipcRenderer.invoke("stopWh3AssetHost"),
+  onWh3AssetHostReset: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on("wh3AssetHostReset", listener);
+    return () => ipcRenderer.removeListener("wh3AssetHostReset", listener);
+  },
+
   prewarmUnitViewerAssets: (sessionId: string, assetPaths: string[]): Promise<UnitViewerAssetsPrewarmResponse> =>
     ipcRenderer.invoke("prewarmUnitViewerAssets", sessionId, assetPaths),
 
@@ -589,7 +697,7 @@ const api = {
     total?: number;
     results?: {
       path: string;
-      ext: "variantmeshdefinition" | "wsmodel" | "rigid_model_v2";
+      ext: "variantmeshdefinition" | "wsmodel" | "rigid_model_v2" | "xml.material" | "dds";
     }[];
     error?: string;
   }> => ipcRenderer.invoke("searchVisualsFiles", sessionId, query, offset, limit),
@@ -687,6 +795,26 @@ const api = {
   ): Promise<PackExportResult> =>
     ipcRenderer.invoke("exportPackedFilesToDirectory", packPath, outputDirectory, filePaths),
 
+  extractVisualsFilesToDirectory: (
+    sessionId: string,
+    outputDirectory: string,
+    filePaths: string[],
+    preserveFolders: boolean,
+    preferredPackPath?: string,
+    excludeCommonTextures?: boolean,
+    recursive?: boolean,
+  ): Promise<PackExportResult> =>
+    ipcRenderer.invoke(
+      "extractVisualsFilesToDirectory",
+      sessionId,
+      outputDirectory,
+      filePaths,
+      preserveFolders,
+      preferredPackPath,
+      excludeCommonTextures,
+      recursive,
+    ),
+
   getDataFolder: (): Promise<string | undefined> => ipcRenderer.invoke("getDataFolder"),
 
   exportCompatReport: (
@@ -694,6 +822,20 @@ const api = {
     suggestedName: string,
   ): Promise<{ success: boolean; savedPath?: string; canceled?: boolean; error?: string }> =>
     ipcRenderer.invoke("exportCompatReport", reportText, suggestedName),
+
+  exportRegionOwnership: (
+    json: string,
+    suggestedName: string,
+  ): Promise<{ success: boolean; savedPath?: string; canceled?: boolean; error?: string }> =>
+    ipcRenderer.invoke("exportRegionOwnership", json, suggestedName),
+
+  importRegionOwnership: (): Promise<{
+    success: boolean;
+    text?: string;
+    filePath?: string;
+    canceled?: boolean;
+    error?: string;
+  }> => ipcRenderer.invoke("importRegionOwnership"),
 
   updateCustomModSources: (data: {
     game: SupportedGames;
@@ -751,6 +893,8 @@ const api = {
     ipcRenderer.on("setIsFeaturesForModdersEnabled", callback),
   setModdersPrefix: (callback: (event: any, moddersPrefix: string) => void) =>
     ipcRenderer.on("setModdersPrefix", callback),
+  setRecentPackPaths: (callback: (event: Electron.IpcRendererEvent, packPaths: string[]) => void) =>
+    ipcRenderer.on("setRecentPackPaths", callback),
 };
 
 export type api = typeof api;

@@ -107,13 +107,16 @@ describe("Visuals data cache", () => {
     const vanilla = getVisualsFilesFromNames([
       "variantmeshes\\unit.variantmeshdefinition",
       "models\\unit.rigid_model_v2",
+      "materials\\unit.xml.material",
       "textures\\unit.dds",
     ]);
     const mod = getVisualsFilesFromNames(["VariantMeshes\\UNIT.variantmeshdefinition", "models\\unit.wsmodel"]);
 
     expect(mergeVisualsFileContributions([vanilla, mod])).toEqual([
+      { path: "materials\\unit.xml.material", ext: "xml.material" },
       { path: "models\\unit.rigid_model_v2", ext: "rigid_model_v2" },
       { path: "models\\unit.wsmodel", ext: "wsmodel" },
+      { path: "textures\\unit.dds", ext: "dds" },
       { path: "VariantMeshes\\UNIT.variantmeshdefinition", ext: "variantmeshdefinition" },
     ]);
   });

@@ -1,5 +1,4 @@
-import { readFromExistingPack, readPack } from "../packFileSerializer";
-import type { Pack } from "../packFileTypes";
+import { readPack, readPackedFileBuffersFromIndex } from "../packFileSerializer";
 import appData from "../appData";
 import { getVanillaPackPathsInLoadOrder } from "../utility/vanillaPackPaths";
 import { getVanillaLocalisationPackPaths } from "../vanillaLocCache/packs";
@@ -19,7 +18,7 @@ import {
 } from "../../tools/esf/src";
 import { DEFAULT_ESF_CAMPAIGN } from "./constants";
 import { buildEsfMapData } from "./data";
-import { encodeDdsAsPng } from "./dds";
+import { encodeDdsAsPngImage } from "./dds";
 import type { EsfMapCampaignOption, EsfMapImage, EsfMapPayload } from "./types";
 
 interface EsfFileCandidate {
@@ -382,26 +381,21 @@ const readPackedFileBuffers = async (
     [...candidatesByPack].map(async ([packPath, packCandidates]) => {
       try {
         const retainedPack = appData.packsData.find((pack) => pack.path === packPath);
-        const pack: Pack = retainedPack
-          ? await readFromExistingPack(retainedPack, {
-              filesToRead: packCandidates.map((candidate) => candidate.fileName),
-              skipParsingTables: true,
-            })
-          : await readPack(packPath, {
-              filesToRead: packCandidates.map((candidate) => candidate.fileName),
-              skipParsingTables: true,
-            });
+        const pack = retainedPack ?? (await readPack(packPath, { skipParsingTables: true }));
+        const payloads = await readPackedFileBuffersFromIndex(
+          pack,
+          packCandidates.map((candidate) => candidate.fileName),
+        );
 
         for (const candidate of packCandidates) {
-          const normalized = normalizePackPath(candidate.fileName);
-          const packedFile = pack.packedFiles.find((file) => normalizePackPath(file.name) === normalized);
-          if (!packedFile?.buffer) {
+          const buffer = payloads.get(candidate.fileName);
+          if (!buffer) {
             if (!allowMissing) {
               throw new Error(`Could not read ${candidate.fileName} from ${candidate.packPath}.`);
             }
             continue;
           }
-          buffers.set(candidate, Buffer.from(packedFile.buffer));
+          buffers.set(candidate, Buffer.from(buffer));
         }
       } catch (error) {
         if (!allowMissing) throw error;
@@ -524,12 +518,16 @@ const convertDdsToMapImage = (
   candidate: EsfFileCandidate,
   width: number,
   height: number,
+  preserveSourceResolution = false,
 ): EsfMapImage => {
   try {
+    const encoded = preserveSourceResolution
+      ? encodeDdsAsPngImage(buffer)
+      : encodeDdsAsPngImage(buffer, width, height);
     return {
-      width,
-      height,
-      src: `data:image/png;base64,${encodeDdsAsPng(buffer, width, height).toString("base64")}`,
+      width: encoded.width,
+      height: encoded.height,
+      src: `data:image/png;base64,${encoded.png.toString("base64")}`,
     };
   } catch (error) {
     throw new Error(
@@ -672,9 +670,10 @@ export async function loadEsfMapData(
       backgroundBuffer && backgroundCandidate
         ? convertDdsToMapImage(backgroundBuffer, backgroundCandidate, map.width, map.height)
         : null,
+    // Keep labels at the texture's native resolution; the renderer scales this layer in the DOM.
     backgroundTextImage:
       backgroundTextBuffer && backgroundTextCandidate
-        ? convertDdsToMapImage(backgroundTextBuffer, backgroundTextCandidate, map.width, map.height)
+        ? convertDdsToMapImage(backgroundTextBuffer, backgroundTextCandidate, map.width, map.height, true)
         : null,
     campaignKey: startposCandidate.campaignName,
     availableCampaigns,

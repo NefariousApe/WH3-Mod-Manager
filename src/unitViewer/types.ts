@@ -83,6 +83,44 @@ export interface UnitViewerGroundEffect {
   multiplier: number;
 }
 
+export interface UnitViewerPainterVariantContext {
+  /** land_units key used by unit_variants_tables.unit. */
+  unitKey: string;
+  /** Faction on the source unit_variants row; empty means the source row is global. */
+  faction: string;
+  variantName: string;
+  unitVariantName: string;
+  unitCard: string;
+  variantDetails: {
+    techFolder: string;
+    variantFilename: string;
+    lowPolyFilename: string;
+    mountScale: string;
+    scale: string;
+    scaleVariation: string;
+    superLowPolyFilename: string;
+  };
+  /** Useful faction keys for the save UI. Free-form faction keys are still allowed. */
+  availableFactions: string[];
+  /** Default uniform colours from factions_tables for previewable factions in the unit's relevant subculture(s). */
+  factionColours?: Array<{
+    faction: string;
+    subculture: string;
+    primary: string;
+    secondary: string;
+    tertiary: string;
+  }>;
+  /** Unit-specific colour overrides from unit_variants_colours_tables. */
+  unitVariantColours?: Array<{
+    faction: string;
+    subculture: string;
+    soldierType: string;
+    primary: string;
+    secondary: string;
+    tertiary: string;
+  }>;
+}
+
 export interface UnitViewerUnitModel {
   key: string;
   landUnitKey: string;
@@ -128,6 +166,10 @@ export interface UnitViewerUnitModel {
   primaryMissileWeapon?: UnitViewerMissileWeapon;
   secondaryMissileWeapon?: UnitViewerMissileWeapon;
   unitCardPath?: string;
+  /** Resolved variantmeshdefinition used by the 3D unit preview. */
+  variantMeshPath?: string;
+  /** Source DB rows needed to optionally save a painted VMD as a faction-specific unit variant. */
+  painterVariantContext?: UnitViewerPainterVariantContext;
   attributes: UnitViewerAttribute[];
   abilities: UnitViewerAbility[];
 }
@@ -216,6 +258,8 @@ export interface UnitViewerCatalogUnit {
   subcultureKeys: string[];
   uiGroupKey: string;
   unitCardPath?: string;
+  /** Resolved variantmeshdefinition used by the 3D unit preview. */
+  variantMeshPath?: string;
   /** Pack path that introduced or overrides this unit; absent means the vanilla database pack. */
   originPackPath?: string;
 }
@@ -224,6 +268,39 @@ export interface UnitViewerCatalogGroup {
   key: string;
   name: string;
   units: UnitViewerCatalogUnit[];
+}
+
+/** An agent subtype and the campaign unit the game associates with it as a general. */
+export interface UnitViewerLordOption {
+  subtype: string;
+  name: string;
+  associatedUnit: string;
+  subcultureKeys: string[];
+  /** Overrides from agent_subtype_subculture_overrides, keyed by their subculture. */
+  associatedUnitBySubculture?: Record<string, string>;
+}
+
+/** One rank threshold from `character_experience_skill_tiers`. */
+export interface UnitViewerCharacterExperienceTier {
+  agentKey: string;
+  rank: number;
+  experienceThreshold: number;
+  campaignKey?: string;
+  forArmy: boolean;
+  forNavy: boolean;
+}
+
+/** One effective faction/subtype -> agent mapping used by character experience tiers. */
+export interface UnitViewerFactionAgentPermittedSubtype {
+  faction: string;
+  agentKey: string;
+  subtype: string;
+}
+
+/** Data needed to turn an exported character rank into the XP accepted by `cm:add_agent_experience`. */
+export interface UnitViewerCharacterExperienceData {
+  tiers: UnitViewerCharacterExperienceTier[];
+  permittedSubtypes: UnitViewerFactionAgentPermittedSubtype[];
 }
 
 /** A roster bucket from ui_unit_group_parents (Lords, Missile Infantry, Extended Roster, …). */
@@ -237,8 +314,10 @@ export interface UnitViewerCatalogResponse {
   success: boolean;
   sessionId?: string;
   groups?: UnitViewerCatalogGroup[];
+  lordOptions?: UnitViewerLordOption[];
   unitGroups?: UnitViewerUiGroup[];
   constants?: UnitViewerConstants;
+  characterExperience?: UnitViewerCharacterExperienceData;
   /** Asset protocol URLs, keyed by the icon's path inside the pack. */
   statIcons?: Record<string, string>;
   error?: string;

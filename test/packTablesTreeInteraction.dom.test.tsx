@@ -1,12 +1,69 @@
 import React from "react";
 import { configureStore } from "@reduxjs/toolkit";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { Provider } from "react-redux";
 import { describe, expect, it, vi } from "vitest";
 
-import appReducer from "../src/appSlice";
+import appReducer, { setDeletedPackFilePaths, setUnsavedPacksData } from "../src/appSlice";
 import PackTablesTreeView from "../src/components/viewer/PackTablesTreeView";
 import initialState from "../src/initialAppState";
+import type { PackedFile } from "../src/packFileTypes";
+
+// jsdom has no layout engine. Keep the test viewport deterministic while retaining the important
+// virtualization contract: only a bounded number of rows are handed to the DOM.
+vi.mock("react-virtualized", () => {
+  const AutoSizer = ({ children }: { children: (size: { height: number; width: number }) => React.ReactNode }) =>
+    children({ height: 360, width: 640 });
+  const List = React.forwardRef<
+    { scrollToPosition: (scrollTop?: number) => void; scrollToRow: (index?: number) => void },
+    {
+      height: number;
+      width: number;
+      rowCount: number;
+      rowHeight: number;
+      overscanRowCount?: number;
+      rowRenderer: (props: { index: number; key: string; parent: null; style: React.CSSProperties }) => React.ReactNode;
+      onScroll?: (event: { scrollTop: number }) => void;
+      scrollTop?: number;
+    }
+  >(({ height, width, rowCount, rowHeight, overscanRowCount = 0, rowRenderer, onScroll, scrollTop = 0 }, ref) => {
+    const scrollElementRef = React.useRef<HTMLDivElement | null>(null);
+    const [startIndex, setStartIndex] = React.useState(Math.floor(scrollTop / rowHeight));
+    React.useImperativeHandle(ref, () => ({
+      scrollToPosition: (nextScrollTop = 0) => {
+        if (scrollElementRef.current) scrollElementRef.current.scrollTop = nextScrollTop;
+        setStartIndex(Math.floor(nextScrollTop / rowHeight));
+      },
+      scrollToRow: (index = 0) => {
+        setStartIndex(Math.max(0, Math.min(index, rowCount - 1)));
+      },
+    }));
+    const visibleRows = Math.min(rowCount - startIndex, Math.ceil(height / rowHeight) + overscanRowCount * 2);
+    return (
+      <div
+        data-testid="virtualized-list"
+        ref={scrollElementRef}
+        onScroll={(event) => {
+          setStartIndex(Math.floor(event.currentTarget.scrollTop / rowHeight));
+          onScroll?.({ scrollTop: event.currentTarget.scrollTop });
+        }}
+        style={{ height, width, overflowY: "auto" }}
+      >
+        {Array.from({ length: visibleRows }, (_, offset) => {
+          const index = startIndex + offset;
+          return rowRenderer({
+            index,
+            key: String(index),
+            parent: null,
+            style: { position: "relative", height: rowHeight, top: index * rowHeight },
+          });
+        })}
+      </div>
+    );
+  });
+  return { AutoSizer, List };
+});
 
 describe("pack table tree interactions", () => {
   const renderPackTree = (
@@ -101,6 +158,264 @@ describe("pack table tree interactions", () => {
     expect(tableLabel.closest("[role='treeitem']")).toHaveAttribute("aria-selected", "true");
   });
 
+  it("marks the node that opened the context menu", () => {
+    renderPackTree(["scripts\\hello.lua"], "files");
+
+    const folderLabel = screen.getByText("scripts");
+    fireEvent.click(folderLabel);
+    const fileLabel = screen.getByText("hello.lua");
+
+    fireEvent.contextMenu(fileLabel);
+
+    expect(fileLabel.closest("[role='treeitem']")).toHaveClass("bg-blue-700/60");
+    expect(folderLabel.parentElement).not.toHaveClass("bg-blue-700/60");
+
+    fireEvent.contextMenu(folderLabel);
+
+    expect(folderLabel.parentElement).toHaveClass("bg-blue-700/60");
+    expect(fileLabel.closest("[role='treeitem']")).not.toHaveClass("bg-blue-700/60");
+  });
+
+  it("expands a single-child folder chain from one click", () => {
+    renderPackTree(["scripts\\nested\\hello.lua"], "files");
+
+    fireEvent.click(screen.getByText("scripts"));
+
+    expect(screen.getByText("nested")).toBeInTheDocument();
+    expect(screen.getByText("hello.lua")).toBeInTheDocument();
+  });
+
+  it("shows folders before files at each tree level", () => {
+    const tree = renderPackTree(
+      ["root-file.lua", "folder\\z-file.lua", "folder\\a-folder\\nested.lua", "folder\\a-file.lua"],
+      "files",
+    );
+
+    const labelsAtLevel = (level: string) =>
+      Array.from(tree.querySelectorAll(`[role="treeitem"][aria-level="${level}"]`)).map((node) =>
+        node.textContent?.trim(),
+      );
+
+    expect(labelsAtLevel("1")).toEqual(["folder", "root-file.lua"]);
+
+    fireEvent.click(screen.getByText("folder"));
+
+    expect(labelsAtLevel("2")).toEqual(["a-folder", "a-file.lua", "z-file.lua"]);
+  });
+
+  it("keeps the DOM bounded for a very large files tree", async () => {
+    const files = Array.from({ length: 10_000 }, (_, index) => `file-${String(index).padStart(5, "0")}.lua`);
+    renderPackTree(files, "files");
+
+    expect(screen.getAllByRole("treeitem").length).toBeLessThan(40);
+    expect(screen.getByText("file-00000.lua")).toBeInTheDocument();
+    expect(screen.queryByText("file-09999.lua")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("file-00000.lua"));
+    fireEvent.keyDown(screen.getByText("file-00000.lua").closest("[role='treeitem']")!, { key: "End" });
+
+    await waitFor(() => expect(screen.getByText("file-09999.lua")).toBeInTheDocument());
+  });
+
+  it("keeps long tree labels on a single virtualized row", () => {
+    renderPackTree(["script_workspace.code-workspace"], "files");
+
+    expect(screen.getByText("script_workspace.code-workspace")).toHaveClass("whitespace-nowrap");
+  });
+
+  it("Ctrl-clicking a folder toggles each descendant leaf independently", () => {
+    renderPackTree(["scripts\\first.lua", "scripts\\second.lua"], "files");
+    fireEvent.click(screen.getByText("scripts"));
+    fireEvent.click(screen.getByText("first.lua"));
+
+    fireEvent.click(screen.getByText("scripts"), { ctrlKey: true });
+
+    expect(screen.getByText("first.lua").closest("[role='treeitem']")).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByText("second.lua").closest("[role='treeitem']")).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps each hidden pack tree's scroll position in its own virtualized list", () => {
+    const packA = "K:\\mods\\a.pack";
+    const packB = "K:\\mods\\b.pack";
+    const store = configureStore({
+      reducer: { app: appReducer },
+      preloadedState: {
+        app: {
+          ...initialState,
+          packsData: {
+            [packA]: { packName: "a.pack", packPath: packA, tables: ["a.lua"], packedFiles: {} },
+            [packB]: { packName: "b.pack", packPath: packB, tables: ["b.lua"], packedFiles: {} },
+          },
+        },
+      },
+    });
+    const treeProps = (packPath: string) => ({
+      packPath,
+      preferredTab: "files" as const,
+      tableFilter: "",
+      showDialog: vi.fn(),
+      onOpenDBTable: vi.fn(),
+      onOpenFlowFile: vi.fn(),
+      onOpenPackedFile: vi.fn(),
+    });
+    const { rerender } = render(
+      <Provider store={store}>
+        <div data-testid="pack-a">
+          <PackTablesTreeView {...treeProps(packA)} />
+        </div>
+        <div data-testid="pack-b" className="hidden">
+          <PackTablesTreeView {...treeProps(packB)} />
+        </div>
+      </Provider>,
+    );
+
+    const listA = within(screen.getAllByTestId("pack-tree-scroll-files")[0]).getByTestId("virtualized-list");
+    const listB = within(screen.getAllByTestId("pack-tree-scroll-files")[1]).getByTestId("virtualized-list");
+    Object.defineProperty(listA, "scrollTop", { configurable: true, value: 123, writable: true });
+    Object.defineProperty(listB, "scrollTop", { configurable: true, value: 47, writable: true });
+    fireEvent.scroll(listA);
+    fireEvent.scroll(listB);
+
+    rerender(
+      <Provider store={store}>
+        <div data-testid="pack-a" className="hidden">
+          <PackTablesTreeView {...treeProps(packA)} />
+        </div>
+        <div data-testid="pack-b">
+          <PackTablesTreeView {...treeProps(packB)} />
+        </div>
+      </Provider>,
+    );
+
+    expect(listA).toHaveProperty("scrollTop", 123);
+    expect(listB).toHaveProperty("scrollTop", 47);
+  });
+
+  it("keeps collapsed DB groups collapsed after deleting a file", async () => {
+    const user = userEvent.setup();
+    const packPath = "K:\\mods\\menu.pack";
+    const deletePackedFiles = vi.fn().mockResolvedValue({
+      success: true,
+      removedPaths: ["db\\first_tables\\data__"],
+    });
+    window.api = { deletePackedFiles } as unknown as NonNullable<Window["api"]>;
+    const store = configureStore({
+      reducer: { app: appReducer },
+      preloadedState: {
+        app: {
+          ...initialState,
+          packsData: {
+            [packPath]: {
+              packName: "menu.pack",
+              packPath,
+              tables: ["db\\first_tables\\first", "db\\second_tables\\second"],
+              packedFiles: {},
+            },
+          },
+        },
+      },
+    });
+
+    render(
+      <Provider store={store}>
+        <PackTablesTreeView
+          packPath={packPath}
+          preferredTab="db"
+          tableFilter=""
+          showDialog={vi.fn()}
+          onOpenDBTable={vi.fn()}
+          onOpenFlowFile={vi.fn()}
+          onOpenPackedFile={vi.fn()}
+        />
+      </Provider>,
+    );
+
+    const secondGroupLabel = screen.getByText("second_tables");
+    const secondGroupNode = secondGroupLabel.closest("[role='treeitem']");
+    expect(secondGroupNode).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(secondGroupLabel);
+    expect(secondGroupNode).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.contextMenu(screen.getByText("first"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete file", exact: true }));
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => expect(deletePackedFiles).toHaveBeenCalledWith(packPath, ["db\\first_tables\\first"]));
+    store.dispatch(
+      setDeletedPackFilePaths({
+        packPath,
+        deletedFilePaths: ["db\\first_tables\\first"],
+      }),
+    );
+
+    await waitFor(() => expect(screen.queryByText("first_tables")).not.toBeInTheDocument());
+    expect(screen.getByText("second_tables").closest("[role='treeitem']")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("keeps an expanded file folder open after importing another file", async () => {
+    const packPath = "K:\\mods\\menu.pack";
+    const selectImportFiles = vi.fn().mockResolvedValue(["C:\\imports\\added.lua"]);
+    const planPackImportFromDisk = vi.fn().mockResolvedValue({
+      items: [{ diskPath: "C:\\imports\\added.lua", packedPath: "scripts\\added.lua" }],
+      errors: [],
+    });
+    const applyPackImportFromDisk = vi.fn().mockResolvedValue({ success: true, importedCount: 1, errors: [] });
+    window.api = {
+      selectImportFiles,
+      planPackImportFromDisk,
+      applyPackImportFromDisk,
+    } as unknown as NonNullable<Window["api"]>;
+    const store = configureStore({
+      reducer: { app: appReducer },
+      preloadedState: {
+        app: {
+          ...initialState,
+          packsData: {
+            [packPath]: {
+              packName: "menu.pack",
+              packPath,
+              tables: ["scripts\\hello.lua", "other\\base.lua"],
+              packedFiles: {},
+            },
+          },
+        },
+      },
+    });
+
+    render(
+      <Provider store={store}>
+        <PackTablesTreeView
+          packPath={packPath}
+          preferredTab="files"
+          tableFilter=""
+          showDialog={vi.fn()}
+          onOpenDBTable={vi.fn()}
+          onOpenFlowFile={vi.fn()}
+          onOpenPackedFile={vi.fn()}
+        />
+      </Provider>,
+    );
+
+    const scriptsLabel = screen.getByText("scripts");
+    fireEvent.click(scriptsLabel);
+    expect(scriptsLabel.closest("[role='treeitem']")).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.contextMenu(scriptsLabel);
+    fireEvent.click(screen.getByRole("button", { name: "Import", exact: true }));
+    fireEvent.click(screen.getByRole("button", { name: /Import Files/ }));
+
+    await waitFor(() => expect(applyPackImportFromDisk).toHaveBeenCalled());
+    store.dispatch(
+      setUnsavedPacksData({
+        packPath,
+        unsavedFileData: [{ name: "scripts\\added.lua" } as PackedFile],
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByText("added.lua")).toBeInTheDocument());
+    expect(screen.getByText("scripts").closest("[role='treeitem']")).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("hides the empty DB tab and offers both creation actions in Files", () => {
     const tree = renderPackTree(["variantmeshes\\variantmeshdefinitions\\unit.variantmeshdefinition"], "db");
 
@@ -142,6 +457,35 @@ describe("pack table tree interactions", () => {
     expect(screen.getByRole("button", { name: "Add New Flow", exact: true })).toBeInTheDocument();
   });
 
+  it("adds a new folder below the right-clicked folder", () => {
+    renderPackTree(["scripts\\hello.lua"], "files");
+
+    fireEvent.contextMenu(screen.getByText("scripts"));
+    fireEvent.click(screen.getByRole("button", { name: "Add", exact: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Add New Folder", exact: true }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Folder name" }), {
+      target: { value: "generated" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create", exact: true }));
+
+    expect(screen.getByText("generated")).toBeInTheDocument();
+    expect(screen.getByText("generated").closest("[role='treeitem']")).toHaveAttribute("aria-level", "2");
+  });
+
+  it("adds a new folder at the pack root when the tree background is right-clicked", () => {
+    const tree = renderPackTree([], "files");
+
+    fireEvent.contextMenu(tree);
+    fireEvent.click(screen.getByRole("button", { name: "Add", exact: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Add New Folder", exact: true }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Folder name" }), {
+      target: { value: "generated" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create", exact: true }));
+
+    expect(screen.getByText("generated").closest("[role='treeitem']")).toHaveAttribute("aria-level", "1");
+  });
+
   it("opens a newly created flow and reports a failed flow save", async () => {
     const saveNodeFlow = vi
       .fn()
@@ -170,7 +514,9 @@ describe("pack table tree interactions", () => {
     fireEvent.change(screen.getByPlaceholderText("Enter flow name..."), { target: { value: "broken.json" } });
     fireEvent.click(screen.getByRole("button", { name: "Create", exact: true }));
 
-    await waitFor(() => expect(showDialog).toHaveBeenCalledWith(expect.stringContaining("disk full"), expect.anything()));
+    await waitFor(() =>
+      expect(showDialog).toHaveBeenCalledWith(expect.stringContaining("disk full"), expect.anything()),
+    );
   });
 
   it("offers active packs and a selectable mod catalog when copying a table", async () => {
@@ -290,6 +636,8 @@ describe("pack table tree interactions", () => {
       "Copy into",
       "Add",
       "separator",
+      "Copy path",
+      "separator",
       "Rename file…",
       "Move file…",
       "Delete file",
@@ -306,6 +654,38 @@ describe("pack table tree interactions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Export", exact: true }));
     expect(screen.getByRole("button", { name: "Export Selection…", exact: true })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export Whole Pack…", exact: true })).toBeInTheDocument();
+    expect(tree).toBeInTheDocument();
+  });
+
+  it("copies the selected packed-file path", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const tree = renderPackTree(["scripts\\hello.lua"], "files");
+
+    fireEvent.click(screen.getByText("scripts"));
+    fireEvent.contextMenu(screen.getByText("hello.lua"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy path", exact: true }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("scripts\\hello.lua"));
+    expect(screen.queryByTestId("pack-tables-context-menu")).not.toBeInTheDocument();
+    expect(tree).toBeInTheDocument();
+  });
+
+  it("copies the clicked folder path instead of its descendant file paths", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const tree = renderPackTree(["scripts\\hello.lua"], "files");
+
+    fireEvent.contextMenu(screen.getByText("scripts"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy path", exact: true }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("scripts"));
     expect(tree).toBeInTheDocument();
   });
 
@@ -390,5 +770,128 @@ describe("pack table tree interactions", () => {
     expect(screen.queryByRole("button", { name: /Delete/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Rename/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Move/ })).not.toBeInTheDocument();
+  });
+
+  it("shows the DB pack Files tab and loads every vanilla folder child at once", async () => {
+    const packPath = "K:\\game\\data\\db.pack";
+    const getVanillaPackFileTree = vi
+      .fn()
+      .mockResolvedValueOnce({ success: true, children: [{ path: "animation", isBranch: true }] })
+      .mockResolvedValueOnce({
+        success: true,
+        children: [
+          { path: "animation\\campaign", isBranch: true },
+          { path: "animation\\campaign\\dragon.anim", isBranch: false },
+          { path: "animation\\campaign\\phoenix.anim", isBranch: false },
+        ],
+      });
+    const previousApi = window.api;
+    window.api = { getVanillaPackFileTree } as unknown as NonNullable<Window["api"]>;
+
+    const store = configureStore({
+      reducer: { app: appReducer },
+      preloadedState: {
+        app: {
+          ...initialState,
+          currentGame: "wh3",
+          packsData: {
+            [packPath]: {
+              packName: "db.pack",
+              packPath,
+              tables: ["db\\units_tables\\data__"],
+              packedFiles: {},
+            },
+          },
+        },
+      },
+    });
+
+    const view = render(
+      <Provider store={store}>
+        <PackTablesTreeView
+          packPath={packPath}
+          preferredTab="files"
+          tableFilter=""
+          showDialog={vi.fn()}
+          onOpenDBTable={vi.fn()}
+          onOpenFlowFile={vi.fn()}
+          onOpenPackedFile={vi.fn()}
+        />
+      </Provider>,
+    );
+
+    try {
+      expect(screen.getByRole("button", { name: "Files", exact: true })).toBeInTheDocument();
+      await waitFor(() => expect(getVanillaPackFileTree).toHaveBeenCalledWith(packPath, ""));
+      expect(screen.getByText("animation")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText("animation"));
+
+      await waitFor(() => expect(getVanillaPackFileTree).toHaveBeenCalledWith(packPath, "animation"));
+      expect(screen.getByText("campaign")).toBeInTheDocument();
+      const campaignNode = screen.getByText("campaign").closest('[role="treeitem"]');
+      if (campaignNode?.getAttribute("aria-expanded") !== "true") fireEvent.click(screen.getByText("campaign"));
+      expect(screen.getByText("dragon.anim")).toBeInTheDocument();
+      expect(screen.getByText("phoenix.anim")).toBeInTheDocument();
+      expect(screen.queryByText(/Load more files/)).not.toBeInTheDocument();
+    } finally {
+      view.unmount();
+      window.api = previousApi;
+    }
+  });
+
+  it("searches unloaded vanilla files through the index cache", async () => {
+    const packPath = "K:\\game\\data\\db.pack";
+    const getVanillaPackFileTree = vi.fn().mockResolvedValue({ success: true, children: [] });
+    const searchVanillaPackFiles = vi.fn().mockResolvedValue({
+      success: true,
+      filePaths: ["audio\\wwise\\dragon.anim"],
+      folderPaths: [],
+      truncated: false,
+    });
+    const previousApi = window.api;
+    window.api = { getVanillaPackFileTree, searchVanillaPackFiles } as unknown as NonNullable<Window["api"]>;
+
+    const store = configureStore({
+      reducer: { app: appReducer },
+      preloadedState: {
+        app: {
+          ...initialState,
+          currentGame: "wh3",
+          packsData: {
+            [packPath]: {
+              packName: "db.pack",
+              packPath,
+              tables: ["db\\units_tables\\data__"],
+              packedFiles: {},
+            },
+          },
+        },
+      },
+    });
+
+    const view = render(
+      <Provider store={store}>
+        <PackTablesTreeView
+          packPath={packPath}
+          preferredTab="files"
+          tableFilter="dragon"
+          showDialog={vi.fn()}
+          onOpenDBTable={vi.fn()}
+          onOpenFlowFile={vi.fn()}
+          onOpenPackedFile={vi.fn()}
+        />
+      </Provider>,
+    );
+
+    try {
+      await waitFor(() => expect(searchVanillaPackFiles).toHaveBeenCalledWith(packPath, "dragon"));
+      await waitFor(() => expect(screen.getByText("dragon.anim")).toBeInTheDocument());
+      expect(screen.getByText("audio")).toBeInTheDocument();
+      expect(screen.getByText("wwise")).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      window.api = previousApi;
+    }
   });
 });

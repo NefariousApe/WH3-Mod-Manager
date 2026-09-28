@@ -32,6 +32,7 @@ import {
   setFromConfig,
   setHasConfigBeenRead,
   setIsAdmin,
+  setCanCreateSymbolicLinks,
   setIsDev,
   setIsFeaturesForModdersEnabled,
   setModdersPrefix,
@@ -46,9 +47,11 @@ import {
   setPackCollisions,
   setPackCollisionsCheckProgress,
   setPackHeaderData,
+  setModLoadOrderRules,
   setPackSearchResults,
   setPacksData,
   setPacksDataRead,
+  setRecentPackPaths,
   setSaves,
   setSkillsData,
   setSkillsViewOptions,
@@ -62,7 +65,6 @@ import { SupportedGames } from "./supportedGames";
 
 setupRendererLogging();
 
-console.log("IN RENDERER (main_window)");
 
 window.api?.subscribedToMods((event, ids: string[]) => {
   console.log("subbed to mods: ", ids);
@@ -84,6 +86,10 @@ window.api?.setIsAdmin((event, isAdmin) => {
   store.dispatch(setIsAdmin(isAdmin));
 });
 
+window.api?.setCanCreateSymbolicLinks((event, canCreate) => {
+  store.dispatch(setCanCreateSymbolicLinks(canCreate));
+});
+
 window.api?.setIsWH3Running((event, isWH3Running) => {
   store.dispatch(setIsWH3Running(isWH3Running));
 });
@@ -102,6 +108,10 @@ window.api?.addToast((event, toast) => {
 
 window.api?.setStartArgs((event, startArgs) => {
   store.dispatch(setStartArgs(startArgs));
+});
+
+window.api?.setRecentPackPaths((event, packPaths) => {
+  store.dispatch(setRecentPackPaths(packPaths));
 });
 
 window.api?.packsInSave((event, packNames: string[]) => {
@@ -285,6 +295,10 @@ window.api?.workshopUpdateCheck((event, message) => {
 
 window.api?.setPackHeaderData((event, packHeaderData: PackHeaderData[]) => {
   store.dispatch(setPackHeaderData(packHeaderData));
+});
+
+window.api?.setModLoadOrderRules((event, modLoadOrderRules: Record<string, LoadOrderRule[]>) => {
+  store.dispatch(setModLoadOrderRules(modLoadOrderRules));
 });
 
 window.api?.setCustomizableMods((event, customizableMods: Record<string, string[]>) => {

@@ -1,4 +1,6 @@
 import appData from "../appData";
+import { vanillaPackNames } from "../supportedGames";
+import { sanitizeRecentPackPaths } from "../utility/recentPackPaths";
 import { emptyGameConfig } from "./migrateAppConfig";
 
 /**
@@ -7,7 +9,18 @@ import { emptyGameConfig } from "./migrateAppConfig";
  */
 export function buildAppConfig(payload: ConfigSavePayload): AppConfig {
   const { config, currentGame } = payload;
-  const { currentPreset, presets, modUserData, ...options } = config;
+  // The load order rules belong to the game, not to the app, so they are pulled out of the flat
+  // renderer payload here and written into the game slot alongside the presets.
+  const {
+    currentPreset,
+    presets,
+    modUserData,
+    loadOrderRules,
+    disabledModLoadOrderRules,
+    loadOrderRuleDisabledPacks,
+    recentPackPaths: payloadRecentPackPaths,
+    ...options
+  } = config;
 
   const games = { ...appData.gameToConfig };
 
@@ -15,7 +28,14 @@ export function buildAppConfig(payload: ConfigSavePayload): AppConfig {
   // game switch by a debounce or two) its presets belong to that game, not to the one we're on now —
   // writing them into the wrong slot is what used to copy whole preset lists between games.
   if (currentGame === appData.currentGame) {
-    games[currentGame] = { currentPreset, presets, modUserData };
+    games[currentGame] = {
+      currentPreset,
+      presets,
+      modUserData,
+      loadOrderRules,
+      disabledModLoadOrderRules,
+      loadOrderRuleDisabledPacks,
+    };
   } else {
     console.log("skipping preset write: renderer is on", currentGame, "but the current game is", appData.currentGame);
   }
@@ -26,6 +46,12 @@ export function buildAppConfig(payload: ConfigSavePayload): AppConfig {
 
   return {
     ...options,
+    // The main process can receive a viewer-open event just before a debounced renderer payload.
+    // Keep that newer history entry when folding the payload into the disk config.
+    recentPackPaths: sanitizeRecentPackPaths(
+      [...(appData.recentPackPaths ?? []), ...(payloadRecentPackPaths ?? [])],
+      [...vanillaPackNames, ...(appData.allVanillaPackNames ?? [])],
+    ),
     games,
     gameFolderPaths: appData.gamesToGameFolderPaths,
   };

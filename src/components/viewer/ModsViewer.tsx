@@ -14,7 +14,7 @@ import PackTablesTableView, {
 import { Resizable } from "re-resizable";
 import debounce from "just-debounce-it";
 import localizationContext from "../../localizationContext";
-import { gameToPackWithDBTablesName } from "../../supportedGames";
+import { gameToPackWithDBTablesName, vanillaPackNames } from "../../supportedGames";
 import { Modal } from "@/src/flowbite";
 import DBDuplication from "@/src/components/viewer/DBDuplication";
 import {
@@ -42,10 +42,14 @@ import { clearPackDataStoreForPack } from "./packDataStore";
 import { clearPreparedTableForPack } from "./tablePrepCache";
 import { getDefaultSaveAsPackName, getPackFileInventory, getPreferredTreeTab, hasLoadedDBTable } from "./viewerHelpers";
 import GlobalSearchPanel from "./GlobalSearchPanel";
+import LoadOrderRulesView from "./LoadOrderRulesView";
+import OpenPackDialog from "./OpenPackDialog";
+import { isLoadOrderRulesPackedFilePath } from "@/src/utility/loadOrderRulesFile";
+import { getVisibleRecentPackCount, MAX_RECENT_PACKS, sanitizeRecentPackPaths } from "@/src/utility/recentPackPaths";
 import { useKeepMountedOnceActive } from "../useKeepMountedOnceActive";
 import type { GlobalSearchDbResult, GlobalSearchLocResult, GlobalSearchResult } from "@/src/globalSearch/types";
 
-type ViewerTabKind = "db" | "flow" | "file";
+type ViewerTabKind = "db" | "flow" | "file" | "loadOrderRules";
 
 type ViewerTab = {
   id: string;
@@ -83,6 +87,10 @@ type CopyTableNameRequest = {
 const EMPTY_TABS: ViewerTab[] = [];
 const EMPTY_PACK_TARGETS: ViewerPackTarget[] = [];
 const MAX_TABLE_HISTORY_ENTRIES = 100;
+const DEFAULT_RECENT_PACK_ROW_HEIGHT = 36;
+const RECENT_PACK_MENU_BOTTOM_MARGIN = 8;
+/** Two 1 px borders plus Tailwind's py-1 (4 px on each side). */
+const RECENT_PACK_MENU_VERTICAL_CHROME = 10;
 /** Below this the modder File button cannot show its label inside the sidebar's width. */
 const TOOLBAR_ICON_ONLY_SIDEBAR_WIDTH = 300;
 
@@ -193,6 +201,7 @@ const ModsViewer = memo(() => {
   const packsDataByPath = useAppSelector((state) => state.app.packsData);
   const unsavedPacksDataByPath = useAppSelector((state) => state.app.unsavedPacksData);
   const deletedPackFilePathsByPath = useAppSelector((state) => state.app.deletedPackFilePaths);
+  const recentPackPaths = useAppSelector((state) => state.app.recentPackPaths);
   const dbPackName = gameToPackWithDBTablesName[currentGame] || "db.pack";
   const selectCurrentPackData = useMemo(makeSelectCurrentPackData, []);
   const selectCurrentPackUnsavedFiles = useMemo(makeSelectCurrentPackUnsavedFiles, []);
@@ -208,6 +217,9 @@ const ModsViewer = memo(() => {
   const [newPackName, setNewPackName] = React.useState("");
   const [isNewPackProcessing, setIsNewPackProcessing] = React.useState(false);
   const [isFileMenuOpen, setIsFileMenuOpen] = useState(false);
+  const [isOpenPackDialogOpen, setIsOpenPackDialogOpen] = useState(false);
+  const [isRecentPacksOpen, setIsRecentPacksOpen] = useState(false);
+  const [visibleRecentPackCount, setVisibleRecentPackCount] = useState(MAX_RECENT_PACKS);
   const [packCloseConfirmPath, setPackCloseConfirmPath] = useState<string | null>(null);
   const [copyOverwriteRequest, setCopyOverwriteRequest] = useState<CopyOverwriteRequest | null>(null);
   const [importConflictRequest, setImportConflictRequest] = useState<PackImportConflictRequest | null>(null);
@@ -268,6 +280,10 @@ const ModsViewer = memo(() => {
     () => (currentPackData ? getPackFileInventory(currentPackData, unsavedFiles) : undefined),
     [currentPackData, unsavedFiles],
   );
+  const availableRecentPackPaths = useMemo(
+    () => sanitizeRecentPackPaths(recentPackPaths, vanillaPackNames),
+    [recentPackPaths],
+  );
 
   const preferredTreeTabCacheRef = useRef<
     Record<
@@ -319,12 +335,12 @@ const ModsViewer = memo(() => {
 
   const treeViewRefs = useRef<Record<string, PackTablesTreeViewHandle | null>>({});
   const treeViewRefCallbacksRef = useRef<Record<string, React.RefCallback<PackTablesTreeViewHandle>>>({});
-  const treeScrollTopsRef = useRef<Record<string, number>>({});
-  const treeScrollElementsRef = useRef<Record<string, HTMLDivElement | null>>({});
   const viewerRootRef = useRef<HTMLDivElement>(null);
   const sidebarResizableRef = useRef<Resizable>(null);
   const fileMenuRef = useRef<HTMLDivElement>(null);
   const fileMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const recentPackMenuRef = useRef<HTMLDivElement>(null);
+  const recentPackFirstButtonRef = useRef<HTMLButtonElement>(null);
   const [isSidebarNarrow, setIsSidebarNarrow] = useState(false);
   const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
   // Hidden rather than unmounted once it has been opened, so closing and reopening keeps the query,
@@ -450,6 +466,29 @@ const ModsViewer = memo(() => {
   }, [isFileMenuOpen]);
 
   useEffect(() => {
+    if (!isFileMenuOpen) setIsRecentPacksOpen(false);
+  }, [isFileMenuOpen]);
+
+  useLayoutEffect(() => {
+    if (!isRecentPacksOpen || availableRecentPackPaths.length === 0) return;
+
+    const updateVisibleRecentPackCount = () => {
+      const menuTop = recentPackMenuRef.current?.getBoundingClientRect().top ?? 0;
+      const rowHeight =
+        recentPackFirstButtonRef.current?.getBoundingClientRect().height || DEFAULT_RECENT_PACK_ROW_HEIGHT;
+      const availableHeight = Math.max(
+        0,
+        window.innerHeight - menuTop - RECENT_PACK_MENU_BOTTOM_MARGIN - RECENT_PACK_MENU_VERTICAL_CHROME,
+      );
+      setVisibleRecentPackCount(getVisibleRecentPackCount(availableHeight, rowHeight));
+    };
+
+    updateVisibleRecentPackCount();
+    window.addEventListener("resize", updateVisibleRecentPackCount);
+    return () => window.removeEventListener("resize", updateVisibleRecentPackCount);
+  }, [availableRecentPackPaths.length, isRecentPacksOpen]);
+
+  useEffect(() => {
     if (!isFeaturesForModdersEnabled) setIsFileMenuOpen(false);
   }, [isFeaturesForModdersEnabled]);
 
@@ -567,17 +606,34 @@ const ModsViewer = memo(() => {
     [localized.viewerFlowPrefix],
   );
 
-  const buildPackedFileTabCandidate = useCallback((filePath: string, packPath: string): ViewerTabCandidate => {
-    const packLabel = getPackNameFromPath(packPath) ?? packPath;
-    const shortFileName = filePath.split(/[\\/]/).pop() ?? filePath;
-    return {
-      fileKey: `file|${packPath}|${filePath}`,
-      title: `${shortFileName}${packLabel ? ` | ${packLabel}` : ""}`,
-      kind: "file",
-      packPath,
-      filePath,
-    };
-  }, []);
+  const buildPackedFileTabCandidate = useCallback(
+    (filePath: string, packPath: string): ViewerTabCandidate => {
+      const packLabel = getPackNameFromPath(packPath) ?? packPath;
+      const shortFileName = filePath.split(/[\\/]/).pop() ?? filePath;
+
+      // The rules file is text on disk but gets its own two column editor, the same way a flow is
+      // json on disk but opens in the node editor.
+      if (isLoadOrderRulesPackedFilePath(filePath)) {
+        const rulesLabel = localized.viewerLoadOrderRulesTitle || "Load Order Rules";
+        return {
+          fileKey: `loadOrderRules|${packPath}`,
+          title: `${rulesLabel}${packLabel ? ` | ${packLabel}` : ""}`,
+          kind: "loadOrderRules",
+          packPath,
+          filePath,
+        };
+      }
+
+      return {
+        fileKey: `file|${packPath}|${filePath}`,
+        title: `${shortFileName}${packLabel ? ` | ${packLabel}` : ""}`,
+        kind: "file",
+        packPath,
+        filePath,
+      };
+    },
+    [localized.viewerLoadOrderRulesTitle],
+  );
 
   const openOrActivatePackTab = useCallback(
     (packPath: string) => {
@@ -1744,9 +1800,24 @@ const ModsViewer = memo(() => {
     setIsNewPackModalOpen(true);
   };
 
+  const handleOpenPackDialog = () => {
+    setIsFileMenuOpen(false);
+    setIsRecentPacksOpen(false);
+    setIsOpenPackDialogOpen(true);
+  };
+
+  const handleOpenPack = useCallback((packPath: string) => {
+    window.api?.requestOpenModInViewer(packPath);
+  }, []);
+
   const handleAddNewFlow = () => {
     setIsFileMenuOpen(false);
     treeViewRefs.current[activePackPath ?? ""]?.openNewFlowDialog();
+  };
+
+  const handleAddLoadOrderRules = () => {
+    setIsFileMenuOpen(false);
+    treeViewRefs.current[activePackPath ?? ""]?.createLoadOrderRulesFile();
   };
 
   const handleOpenDBPack = () => {
@@ -1754,6 +1825,12 @@ const ModsViewer = memo(() => {
     setIsFileMenuOpen(false);
     window.api?.requestOpenModInViewer(dbPackName);
   };
+
+  const handleOpenRecentPack = useCallback((packPath: string) => {
+    setIsRecentPacksOpen(false);
+    setIsFileMenuOpen(false);
+    window.api?.requestOpenModInViewer(packPath);
+  }, []);
 
   const handleNewPackConfirm = useCallback(async () => {
     if (!newPackName.trim()) {
@@ -1815,8 +1892,6 @@ const ModsViewer = memo(() => {
       clearPreparedTableForPack(packPath);
       // referencesHash is global to the renderer and is refreshed by the next pack data-store update.
       delete preferredTreeTabCacheRef.current[packPath];
-      delete treeScrollTopsRef.current[packPath];
-      delete treeScrollElementsRef.current[packPath];
       delete treeViewRefs.current[packPath];
       delete treeViewRefCallbacksRef.current[packPath];
       suppressDefaultTableOpenForPackPathsRef.current.delete(packPath);
@@ -1836,12 +1911,6 @@ const ModsViewer = memo(() => {
     },
     [closePackTab, deletedPackFilePathsByPath, unsavedPacksDataByPath],
   );
-
-  useLayoutEffect(() => {
-    if (!activePackPath) return;
-    const scrollElement = treeScrollElementsRef.current[activePackPath];
-    if (scrollElement) scrollElement.scrollTop = treeScrollTopsRef.current[activePackPath] ?? 0;
-  }, [activePackPath]);
 
   useLayoutEffect(() => {
     const sidebarElement = sidebarResizableRef.current?.resizable;
@@ -1867,10 +1936,15 @@ const ModsViewer = memo(() => {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === "f") {
-        document.getElementById("dbTableFilter")?.focus();
-        e.stopImmediatePropagation();
-      }
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "f") return;
+
+      // CodeMirror owns Ctrl/Cmd+F inside its editor and search panel. The viewer filter should
+      // only handle the shortcut when focus is elsewhere in the viewer.
+      if (e.target instanceof Element && e.target.closest(".cm-editor")) return;
+
+      e.preventDefault();
+      document.getElementById("dbTableFilter")?.focus();
+      e.stopImmediatePropagation();
     };
 
     document.addEventListener("keydown", onKeyDown);
@@ -1934,6 +2008,14 @@ const ModsViewer = memo(() => {
           </Modal.Body>
         </Modal>
       )}
+
+      {/* Open Pack Modal */}
+      <OpenPackDialog
+        show={isOpenPackDialogOpen}
+        currentPackPath={activePackPath}
+        onClose={() => setIsOpenPackDialogOpen(false)}
+        onOpenPack={handleOpenPack}
+      />
 
       {/* Save As Modal */}
       <Modal onClose={() => setIsSaveAsModalOpen(false)} show={isSaveAsModalOpen} size="md" position="center">
@@ -2291,7 +2373,7 @@ const ModsViewer = memo(() => {
                         id="mods-viewer-file-menu"
                         role="menu"
                         aria-label={localized.viewerFile || "File"}
-                        className="absolute left-0 top-full z-50 mt-1 min-w-[10rem] overflow-hidden rounded-md border border-gray-600 bg-gray-800 py-1 shadow-xl"
+                        className="absolute left-0 top-full z-50 mt-1 min-w-[10rem] rounded-md border border-gray-600 bg-gray-800 py-1 shadow-xl"
                       >
                         <button
                           type="button"
@@ -2304,10 +2386,78 @@ const ModsViewer = memo(() => {
                         <button
                           type="button"
                           role="menuitem"
+                          onClick={handleOpenPackDialog}
+                          className="block w-full whitespace-nowrap px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700"
+                        >
+                          {localized.viewerOpenPack || "Open Pack"}
+                        </button>
+                        <div
+                          className="relative"
+                          onMouseLeave={(event) => {
+                            const relatedTarget = event.relatedTarget;
+                            if (relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget)) return;
+                            setIsRecentPacksOpen(false);
+                          }}
+                        >
+                          <button
+                            type="button"
+                            role="menuitem"
+                            aria-haspopup="menu"
+                            aria-expanded={isRecentPacksOpen}
+                            onMouseEnter={() => setIsRecentPacksOpen(true)}
+                            onClick={() => setIsRecentPacksOpen(true)}
+                            className="block w-full whitespace-nowrap px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700"
+                          >
+                            <span className="flex items-center justify-between gap-4">
+                              <span>{localized.viewerOpenRecent || "Open Recent"}</span>
+                              <span aria-hidden="true">▶</span>
+                            </span>
+                          </button>
+                          {isRecentPacksOpen && (
+                            <div
+                              ref={recentPackMenuRef}
+                              role="menu"
+                              aria-label={localized.viewerOpenRecent || "Open Recent"}
+                              className="absolute left-full top-0 z-50 min-w-[16rem] max-w-[28rem] overflow-hidden rounded-md border border-gray-600 bg-gray-800 py-1 shadow-xl"
+                            >
+                              {availableRecentPackPaths.length > 0 ? (
+                                availableRecentPackPaths.slice(0, visibleRecentPackCount).map((packPath, index) => (
+                                  <button
+                                    key={packPath}
+                                    ref={index === 0 ? recentPackFirstButtonRef : undefined}
+                                    type="button"
+                                    role="menuitem"
+                                    data-testid={`recent-pack-${index}`}
+                                    onClick={() => handleOpenRecentPack(packPath)}
+                                    title={packPath}
+                                    className="block w-full truncate px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700"
+                                  >
+                                    {getPackFileName(packPath)}
+                                  </button>
+                                ))
+                              ) : (
+                                <div role="menuitem" aria-disabled="true" className="px-3 py-2 text-sm text-gray-500">
+                                  {localized.viewerNoRecentPacks || "No recent packs"}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          role="menuitem"
                           onClick={handleAddNewFlow}
                           className="block w-full whitespace-nowrap px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700"
                         >
                           {localized.viewerAddNewFlow || "Add New Flow"}
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={handleAddLoadOrderRules}
+                          className="block w-full whitespace-nowrap px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700"
+                        >
+                          {localized.viewerAddNewLoadOrderRules || "Add New Load Order Rules"}
                         </button>
                         <button
                           type="button"
@@ -2442,14 +2592,8 @@ const ModsViewer = memo(() => {
                     {packTabs.map((packTab) => (
                       <div
                         key={packTab.packPath}
-                        ref={(element) => {
-                          treeScrollElementsRef.current[packTab.packPath] = element;
-                        }}
-                        onScroll={(event) => {
-                          treeScrollTopsRef.current[packTab.packPath] = event.currentTarget.scrollTop;
-                        }}
                         className={
-                          "absolute inset-0 overflow-auto scrollbar scrollbar-track-gray-700 scrollbar-thumb-blue-700 " +
+                          "absolute inset-0 overflow-hidden scrollbar scrollbar-track-gray-700 scrollbar-thumb-blue-700 " +
                           (packTab.packPath === activePackPath ? "" : "hidden")
                         }
                       >
@@ -2553,6 +2697,12 @@ const ModsViewer = memo(() => {
                       </div>
                     ) : activeTab.kind === "flow" && activeTab.flowFile ? (
                       <NodeEditor currentFile={activeTab.flowFile} currentPack={activeTab.packPath} />
+                    ) : activeTab.kind === "loadOrderRules" && activeTab.filePath ? (
+                      <LoadOrderRulesView
+                        packPath={activeTab.packPath}
+                        filePath={activeTab.filePath}
+                        showDialog={showDialog}
+                      />
                     ) : activeTab.kind === "file" && activeTab.filePath ? (
                       <PackFileView
                         packPath={activeTab.packPath}
