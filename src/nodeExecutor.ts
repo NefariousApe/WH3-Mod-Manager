@@ -6212,8 +6212,11 @@ async function executeDumpToTSVNode(
 
     const fs = require("fs");
     const nodePath = require("path");
-    const gamePath = appData.gamesToGameFolderPaths[appData.currentGame].gamePath as string;
+    
+    // let gamePath = appData.gamesToGameFolderPaths[appData.currentGame].gamePath as string;
+    const gamePath = "E:\\WH3ModStuff"
     const outputPath = nodePath.join(gamePath, filename);
+
 
     fs.writeFileSync(outputPath, tsvLines.join("\n"), "utf-8");
 
@@ -6273,7 +6276,7 @@ async function executeDumpToTSVNode(
 
   try {
     // Get game path from appData
-    const gamePath = appData.gamesToGameFolderPaths[appData.currentGame].gamePath as string;
+    const gamePath = "E:\\WH3ModStuff"
 
     // Build TSV content
     const tsvLines: string[] = [];
